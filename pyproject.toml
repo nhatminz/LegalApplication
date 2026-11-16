@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "legal-application-benchmark"
+version = "0.1.0"
+description = "Issue-level Vietnamese legal application benchmark with LEGIT 5–2–3 scoring"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.27,<1", "jsonschema>=4.21,<5"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+legal-application = "legal_application.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+legal_application = ["prompts/*.txt", "schemas/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+

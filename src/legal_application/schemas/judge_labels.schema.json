@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["doc_name", "issues_evaluation", "final_order_correct", "final_order_explanation", "needs_review", "evaluation_status"],
+  "properties": {
+    "doc_name": {"type": "string", "minLength": 1},
+    "issues_evaluation": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["issue_index", "original_issue", "covered", "correct", "extracted_model_verdict", "inferred_reference_verdict", "explanation", "needs_review"],
+        "properties": {
+          "issue_index": {"type": "integer", "minimum": 1},
+          "original_issue": {"type": "string", "minLength": 1},
+          "covered": {"type": "boolean"},
+          "correct": {"type": ["boolean", "null"]},
+          "extracted_model_verdict": {"type": ["string", "null"]},
+          "inferred_reference_verdict": {"type": ["string", "null"]},
+          "explanation": {"type": "string", "minLength": 1},
+          "needs_review": {"type": "boolean"}
+        }
+      }
+    },
+    "final_order_correct": {"type": ["boolean", "null"]},
+    "final_order_explanation": {"type": "string", "minLength": 1},
+    "needs_review": {"type": "boolean"},
+    "evaluation_status": {"enum": ["completed", "needs_review"]}
+  }
+}
