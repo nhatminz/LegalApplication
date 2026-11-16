@@ -17,6 +17,7 @@ export GENERATOR_THINKING_MODE="${GENERATOR_THINKING_MODE:-none}"
 
 # Runtime paths are based on PROJECT_ROOT. Relative path exports also resolve from it.
 export PROJECT_ROOT="${PROJECT_ROOT:-/workspace/storage-shared/nlp/minhpn19/LegalApplication}"
+# Dòng JSON lỗi sẽ được ghi log rồi xóa khỏi INPUT_JSONL trước khi gọi model.
 export INPUT_JSONL="${INPUT_JSONL:-${PROJECT_ROOT}/input/judgment_with_issues_sample.jsonl}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs}"
 export RUN_ID="${RUN_ID:-}"  # Empty -> Vietnam local timestamp + random suffix.

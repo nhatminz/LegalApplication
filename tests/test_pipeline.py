@@ -20,7 +20,7 @@ def run(config, transports):
 def test_full_pipeline_artifacts_and_resume(config_factory, mock_transports):
     config = config_factory([make_record(f"case-{i}") for i in range(5)], batch_size=2)
     summary = run(config, mock_transports)
-    assert summary["counts"] == {"input": 5, "input_valid": 5, "selected": 5, "attempted": 5, "completed": 5, "failed": 0,
+    assert summary["counts"] == {"input": 5, "input_valid": 5, "input_removed": 0, "selected": 5, "attempted": 5, "completed": 5, "failed": 0,
                                  "pending": 0, "skipped": 0, "scored": 5, "needs_review": 0}
     assert summary["mean_score"] == 10
     gen = read_jsonl(config.run_dir / "generations.jsonl")
@@ -314,17 +314,24 @@ def test_uncertain_gold_excluded_from_all_means(config_factory, mock_transports)
     assert review["score_components"]["total"] is None
 
 
-def test_malformed_input_blocks_all_api_even_with_limit(config_factory, mock_transports):
+def test_malformed_input_beyond_limit_is_deleted_and_run_continues(config_factory, mock_transports):
     config = config_factory(limit=1)
+    original = config.input_jsonl.read_bytes()
     with config.input_jsonl.open("a") as handle:
         handle.write('{"broken"')
-    with pytest.raises(DatasetError):
-        run(config, mock_transports)
-    assert not mock_transports[2]["generator"] and not mock_transports[2]["judge"]
-    summary = json.loads((config.run_dir / "summary.json").read_text())
-    assert summary["status"] == "input_validation_failed"
-    assert summary["input_validation_errors"][0]["input_line"] == 2
-    assert summary["counts"]["attempted"] == 0
+    summary = run(config, mock_transports)
+    assert summary["status"] == "completed"
+    assert summary["counts"]["input"] == 2
+    assert summary["counts"]["input_valid"] == summary["counts"]["input_removed"] == 1
+    assert len(mock_transports[2]["generator"]) == len(mock_transports[2]["judge"]) == 1
+    assert config.input_jsonl.read_bytes() == original
+    removed = read_jsonl(config.run_dir / "removed_input_lines.jsonl")
+    assert removed[0]["original_input_line"] == 2
+    assert removed[0]["raw_line"] == '{"broken"'
+    summary = run(replace(config, resume=True), mock_transports)
+    assert summary["counts"]["input_removed"] == 1
+    assert summary["counts"]["skipped"] == 1
+    assert len(read_jsonl(config.run_dir / "removed_input_lines.jsonl")) == 1
 
 
 def test_validate_only_never_calls_api(config_factory, mock_transports):

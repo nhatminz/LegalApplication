@@ -9,6 +9,7 @@ from uuid import uuid4
 from .api import APIClient, APIError, IncompleteResponse
 from .config import Config
 from .data import DatasetError, Sample, canonical_hash, read_dataset, strict_json
+from .input_cleanup import clean_input
 from .prompts import generator_messages, judge_messages
 from .scoring import LABEL_SCHEMA, LabelError, score_labels
 from .storage import RunStore, file_hash, implementation_hash, now, read_jsonl
@@ -108,6 +109,7 @@ class Pipeline:
         self.counters = {role: {"attempted": 0, "completed": 0, "failed": 0, "skipped": 0}
                          for role in ["generation", "evaluation"]}
         self.preexisting_evaluations = 0
+        self.input_cleanup = {}
 
     def failure(self, store: RunStore, sample: Sample, stage: str, exc: Exception) -> None:
         record = {**sample.identity(), "stage": stage, "error_type": type(exc).__name__, "error": str(exc),
@@ -139,10 +141,12 @@ class Pipeline:
                     "this_invocation": self.counters[name]}
 
         return {"run_id": self.config.run_id, "status": status, "updated_at": now(),
-                "counts": {"input": dataset.input_count, "input_valid": dataset.input_count, "selected": selected,
+                "counts": {"input": self.input_cleanup.get("original_line_count", dataset.input_count),
+                           "input_valid": dataset.input_count, "input_removed": self.input_cleanup.get("removed_count", 0), "selected": selected,
                            "attempted": len(attempted), "completed": len(self.evaluations), "failed": len(failed_docs),
                            "pending": selected - len(self.evaluations) - len(failed_docs),
                            "skipped": self.preexisting_evaluations, "scored": len(scored), "needs_review": review},
+                "input_cleanup": self.input_cleanup,
                 "generation": stage("generation", self.generations, generation_failures),
                 "evaluation": stage("evaluation", self.evaluations, evaluation_failures),
                 "mean_score": mean(r["score_components"]["total"] for r in scored) if scored else None,
@@ -186,20 +190,23 @@ class Pipeline:
     async def _run(self, store: RunStore) -> dict:
         config = self.config
         snapshot = {**config.snapshot(), "artifact_version": 1, "implementation_sha256": implementation_hash(),
-                    "input_sha256": file_hash(config.input_jsonl),
                     "generation_source_sha256": file_hash(config.generation_jsonl) if config.generation_jsonl else None,
                     "judge_reasoning_effort": "xhigh", "judge_reasoning_parameters": {"thinking": True, "reasoning_effort": 75}}
-        store.configure(snapshot)
         log.info("Run start run_id=%s mode=%s limit=%s batch_size=%d invocation=%s", config.run_id, config.mode, config.limit, config.batch_size, self.invocation_id)
+        self.input_cleanup = clean_input(config.input_jsonl, store.path,
+                                        lambda digest: store.configure({**snapshot, "input_sha256": digest}))
+        snapshot["input_sha256"] = self.input_cleanup["input_sha256_after"]
         try:
             dataset = read_dataset(config.input_jsonl, config.limit)
         except DatasetError as exc:
             for error in exc.errors:
                 log.error("Input invalid line=%s error=%s", error["input_line"], error["error"])
             summary = {"run_id": config.run_id, "status": "input_validation_failed",
-                       "counts": {"input": exc.input_count, "input_valid": exc.valid_count, "selected": 0,
+                       "counts": {"input": self.input_cleanup["original_line_count"], "input_valid": exc.valid_count,
+                                  "input_removed": self.input_cleanup["removed_count"], "selected": 0,
                                   "attempted": 0, "completed": 0, "failed": 0, "skipped": 0, "scored": 0, "needs_review": 0},
                        "input_validation_error_count": len(exc.errors), "input_validation_errors": exc.errors,
+                       "input_cleanup": self.input_cleanup,
                        "mean_score": None, "mean_score_components": dict.fromkeys(["final_order", "coverage", "correctness", "total"]),
                        "updated_at": now()}
             store.summary(summary)
