@@ -1,5 +1,7 @@
 # Legal Application Benchmark
 
+Hướng dẫn đầy đủ từng lệnh với checkpoint local Qwen3-4B, môi trường Python hiện có và concurrency 20: [HUONG_DAN_CHAY.md](HUONG_DAN_CHAY.md).
+
 Đánh giá năng lực áp dụng pháp luật của LLM trên bản án Việt Nam. Mỗi bản án được gửi trong **một request generator**, gồm toàn bộ facts_clean, issues và luật theo thứ tự gốc. Bài làm là văn bản tự do, giải quyết và đưa ra phán quyết **riêng cho từng issue**. Không yêu cầu phán quyết cuối cùng cho toàn vụ án.
 
 Judge đọc đầy đủ nguồn tham chiếu, suy ra kết quả từng issue trực tiếp từ application/conclusion, gán nhãn và giải thích. Python kiểm tra schema, mapping và tính điểm. Không xây Legal Issue Tree hoặc một pipeline tạo gold riêng.
