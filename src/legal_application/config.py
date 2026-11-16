@@ -33,9 +33,9 @@ class Config:
     mode: str = "full"
     generation_jsonl: Path | None = None
     limit: int | None = None
-    batch_size: int = 8
-    generator_concurrency: int = 2
-    judge_concurrency: int = 2
+    batch_size: int = 20
+    generator_concurrency: int = 20
+    judge_concurrency: int = 20
     max_output_tokens: int = 32768
     timeout_seconds: float = 1800
     api_max_retries: int = 3
@@ -64,9 +64,9 @@ class Config:
             judge_model=e.get("JUDGE_MODEL", "DeepSeek-V4.1-Flash-1017"),
             mode=e.get("MODE", "full"), generation_jsonl=rooted(root, source) if source else None,
             limit=None if limit.lower() in {"", "all", "none"} else int(limit),
-            batch_size=int(e.get("BATCH_SIZE", "8")),
-            generator_concurrency=int(e.get("GENERATOR_CONCURRENCY", "2")),
-            judge_concurrency=int(e.get("JUDGE_CONCURRENCY", "2")),
+            batch_size=int(e.get("BATCH_SIZE", "20")),
+            generator_concurrency=int(e.get("GENERATOR_CONCURRENCY", "20")),
+            judge_concurrency=int(e.get("JUDGE_CONCURRENCY", "20")),
             max_output_tokens=int(e.get("MAX_OUTPUT_TOKENS", "32768")),
             timeout_seconds=float(e.get("API_TIMEOUT_SECONDS", "1800")),
             api_max_retries=int(e.get("API_MAX_RETRIES", "3")),

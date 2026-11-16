@@ -6,15 +6,15 @@ Judge đọc đầy đủ nguồn tham chiếu, suy ra kết quả từng issue 
 
 ## Cài đặt trên B200
 
-Client cần Python **>=3.10**, không cần GPU hay PyTorch. Môi trường hiện được kiểm thử bằng Python 3.12. Server vLLM được triển khai riêng.
+Client cần Python **>=3.10**, không cần GPU hay PyTorch. Dùng môi trường `.venv` hiện có của bạn, đặt ở bất kỳ thư mục nào. Script gọi `python` trên PATH sau khi activate môi trường; không kiểm tra phiên bản thư viện hoặc yêu cầu `.venv` trong project. Server vLLM được triển khai riêng.
 
 ```bash
+# Activate môi trường .venv hiện có của bạn trước khi chạy các lệnh này.
 export PROJECT_ROOT="${PROJECT_ROOT:-/workspace/storage-shared/nlp/minhpn19/LegalApplication}"
 cd "$PROJECT_ROOT"
-python3.12 -m venv .venv
-.venv/bin/python -m pip install -e '.[test]'
-.venv/bin/python -m pytest -q
 ```
+
+Nếu môi trường đã có đầy đủ dependencies, chạy trực tiếp entry point. Khi cần cài vào một môi trường mới, dùng `python -m pip install -r requirements.txt`; `requirements-dev.txt` bao gồm dependencies runtime và pytest. Script chạy trực tiếp package từ `src/`; nếu muốn dùng thêm lệnh `legal-application` sau khi cài package, có thể cài `python -m pip install -e .`. Dependencies cũng được khai báo trong `pyproject.toml`. vLLM được cài riêng trong môi trường host model.
 
 Entry point chính: `bash "$PROJECT_ROOT/scripts/run_application.sh"`. Script không tự cài hoặc khởi động model. Paths tương đối được resolve từ PROJECT_ROOT, kể cả khi gọi từ thư mục khác. Path tuyệt đối do người dùng export được giữ nguyên.
 
@@ -46,7 +46,7 @@ MODE=validate-only RUN_ID=schema-check \
 Lệnh không gọi model, trả exit code 2 và lưu chẩn đoán trong `outputs/schema-check/summary.json` và run.log. Cần lấy lại dòng lỗi từ nguồn trước khi chạy full dataset. Để smoke test riêng 1–5 bản án đã đọc được, có thể **chủ động tạo một tệp khác** chứa đúng 5 dòng đầu, không sửa tệp nguồn:
 
 ```bash
-.venv/bin/python - <<'PY'
+python - <<'PY'
 import os
 from itertools import islice
 from pathlib import Path
@@ -63,7 +63,25 @@ MODE=validate-only INPUT_JSONL=input/smoke_5.jsonl RUN_ID=smoke-schema \
 
 ## Endpoint và xhigh
 
-Generator dùng OpenAI-compatible `POST <GENERATOR_BASE_URL>/chat/completions`, không ép JSON. Bắt buộc cấu hình tên model thực tế do endpoint phục vụ; không có checkpoint mặc định. Nếu tự host bằng vLLM, triển khai checkpoint đã có bằng ví dụ khung sau trong môi trường server riêng:
+Generator dùng OpenAI-compatible `POST <GENERATOR_BASE_URL>/chat/completions`, không ép JSON. Phần đầu `scripts/run_application.sh` có hai exports để đổi model được đánh giá. Script hiện điền sẵn ví dụ Qwen3-4B; bạn có thể sửa giá trị sau `:-` trực tiếp trong file hoặc export từ terminal để ghi đè:
+
+```bash
+export GENERATOR_BASE_URL="${GENERATOR_BASE_URL:-http://127.0.0.1:8001/v1}"
+export GENERATOR_MODEL="${GENERATOR_MODEL:-Qwen/Qwen3-4B}"
+```
+
+`GENERATOR_BASE_URL` là địa chỉ API của máy host model, có `/v1` ở cuối. Nếu pipeline và server cùng máy B200, dùng `127.0.0.1`; nếu server ở máy khác, thay bằng IP/hostname máy đó. `GENERATOR_MODEL` là tên model endpoint phục vụ, phải khớp `--served-model-name`, không phải link tải checkpoint. Biến đã export ở terminal có ưu tiên cao hơn giá trị mặc định trong script.
+
+Ví dụ mở một terminal riêng trên B200 để host Qwen3-4B:
+
+```bash
+vllm serve Qwen/Qwen3-4B \
+  --served-model-name Qwen/Qwen3-4B \
+  --host 0.0.0.0 --port 8001 \
+  --reasoning-parser qwen3
+```
+
+Parser `qwen3` tách phần reasoning khỏi final content theo [tài liệu triển khai Qwen với vLLM](https://qwen.readthedocs.io/en/stable/deployment/vllm.html). `GENERATOR_THINKING_MODE=none` trong client chỉ có nghĩa không gửi tham số reasoning riêng; không tắt thinking mặc định của Qwen. Script không tự tải, khởi động hoặc host checkpoint. Nếu dùng checkpoint khác đã có, có thể triển khai bằng ví dụ khung sau trong môi trường server riêng:
 
 ```bash
 : "${MODEL_PATH:?Đặt đường dẫn checkpoint đã được cung cấp}"
@@ -82,7 +100,7 @@ Judge mặc định cố định là `DeepSeek-V4.1-Flash-1017` tại `http://17
 {"chat_template_kwargs":{"thinking":true,"reasoning_effort":75}}
 ```
 
-Không gửi `reasoning_effort="xhigh"` ở top level và không dùng cách map của hosted DeepSeek API. Budget 75 là tham số effort, độc lập với `max_tokens`. Mặc định generator không gửi tham số reasoning riêng vì checkpoint chưa được xác định. Nếu generator cũng là DeepSeek vLLM tương ứng, đặt `GENERATOR_THINKING_MODE=deepseek_vllm_xhigh` để gửi đúng body trên.
+Không gửi `reasoning_effort="xhigh"` ở top level và không dùng cách map của hosted DeepSeek API. Budget 75 là tham số effort, độc lập với `max_tokens`. Mặc định generator không gửi tham số reasoning riêng và dùng thiết lập của server/template. Nếu generator cũng là DeepSeek vLLM tương ứng, đặt `GENERATOR_THINKING_MODE=deepseek_vllm_xhigh` để gửi đúng body trên.
 
 Judge mặc định dùng `response_format.type=json_schema`, `strict=true`. Nếu endpoint chỉ hỗ trợ JSON object, có thể **cấu hình rõ trước run mới** `JUDGE_RESPONSE_FORMAT=json_object`; pipeline vẫn validate cùng schema ở phía Python. Không tự fallback sau HTTP 400, không tắt xhigh ngầm. `message.reasoning_content` không được đọc, lưu hoặc chuyển vai trò; raw response trong artifacts là nguyên văn `message.content`, không strip whitespace. Endpoint reasoning cần tách final content đúng cách.
 
@@ -99,13 +117,13 @@ export INPUT_JSONL='input/smoke_5.jsonl'
 MODE=full LIMIT=1 RUN_ID=smoke-1 \
   bash "$PROJECT_ROOT/scripts/run_application.sh"
 
-# 5 samples; batch cuối được xử lý cả khi không đủ BATCH_SIZE
-MODE=full LIMIT=5 BATCH_SIZE=2 RUN_ID=smoke-5 \
+# 5 samples; vẫn xử lý đủ dù ít hơn BATCH_SIZE=20
+MODE=full LIMIT=5 BATCH_SIZE=20 RUN_ID=smoke-5 \
   bash "$PROJECT_ROOT/scripts/run_application.sh"
 
 # Toàn bộ dataset ĐÃ SỬA/VALIDATE; không có cap mặc định 1000
 MODE=full INPUT_JSONL=input/full_dataset.jsonl LIMIT=all \
-  BATCH_SIZE=8 GENERATOR_CONCURRENCY=4 JUDGE_CONCURRENCY=4 \
+  BATCH_SIZE=20 GENERATOR_CONCURRENCY=20 JUDGE_CONCURRENCY=20 \
   RUN_ID=full-run bash "$PROJECT_ROOT/scripts/run_application.sh"
 ```
 
@@ -128,7 +146,7 @@ Mỗi RUN_ID có thư mục riêng. Nếu thư mục đã tồn tại, mặc đ�
 
 ```bash
 # Các export và tham số phải giống run smoke-5 ở trên.
-MODE=full LIMIT=5 BATCH_SIZE=2 RUN_ID=smoke-5 RESUME=1 \
+MODE=full LIMIT=5 BATCH_SIZE=20 RUN_ID=smoke-5 RESUME=1 \
   bash "$PROJECT_ROOT/scripts/run_application.sh"
 ```
 
@@ -179,7 +197,7 @@ Các artifacts thành công không có record giả thay thế cho lỗi. Muốn
 
 Summary được ghi atomic sau mỗi batch và khi dừng có kiểm soát. Nếu bị kill cứng giữa batch, JSONL đã commit là nguồn chính xác để resume và tính lại summary. Trường hợp preflight lỗi input có số dòng hợp lệ, danh sách validation errors và attempted=0; không chọn sample từ dataset lỗi.
 
-Mỗi batch chạy generator rồi Judge. Mỗi stage có worker pool và semaphore riêng; không tạo số tasks theo toàn dataset. HTTP retry áp dụng cho timeout/connection lỗi, 408/409/429/5xx và malformed API envelope; backoff lũy tiến có jitter, tối đa khoảng 60 giây. Judge JSON/schema/mapping errors có budget retry riêng và luôn nhận đầy đủ dữ liệu ban đầu, không nối các draft lỗi vào context. HTTP 400/401/404/422 không retry ngầm. Input và các selected records được nạp vào RAM; BATCH_SIZE điều khiển lịch request, không phải một cam kết giới hạn RAM cho phần dữ liệu/artifacts đã nạp.
+Mặc định mỗi batch có tối đa 20 samples: chạy tối đa 20 request generator đồng thời, rồi tối đa 20 request Judge đồng thời. Batch cuối ít hơn 20 vẫn được xử lý đầy đủ. LIMIT điều khiển tổng số samples của run, độc lập với BATCH_SIZE/concurrency. Mỗi stage có worker pool và semaphore riêng; không tạo số tasks theo toàn dataset. HTTP retry áp dụng cho timeout/connection lỗi, 408/409/429/5xx và malformed API envelope; backoff lũy tiến có jitter, tối đa khoảng 60 giây. Judge JSON/schema/mapping errors có budget retry riêng và luôn nhận đầy đủ dữ liệu ban đầu, không nối các draft lỗi vào context. HTTP 400/401/404/422 không retry ngầm. Input và các selected records được nạp vào RAM; BATCH_SIZE điều khiển lịch request, không phải một cam kết giới hạn RAM cho phần dữ liệu/artifacts đã nạp.
 
 Exit codes: **0** khi hoàn tất hoặc validate thành công (có thể có review); **1** khi còn sample failed; **2** khi cấu hình/preflight/mapping bị lỗi; **130** khi Ctrl-C.
 
@@ -191,12 +209,12 @@ Mọi biến dưới đây có thể export hoặc sửa mặc định ở đầ
 |---|---|
 | `PROJECT_ROOT` | `/workspace/storage-shared/nlp/minhpn19/LegalApplication` |
 | `INPUT_JSONL` | `$PROJECT_ROOT/input/judgment_with_issues_sample.jsonl` |
-| `GENERATOR_BASE_URL`, `GENERATOR_MODEL` | Bắt buộc trong full mode |
+| `GENERATOR_BASE_URL`, `GENERATOR_MODEL` | Script điền sẵn `http://127.0.0.1:8001/v1`, `Qwen/Qwen3-4B`; sửa ở đầu script hoặc export để đổi model/server. Python CLI trực tiếp vẫn yêu cầu cấu hình rõ |
 | `JUDGE_BASE_URL` | `http://172.29.62.173:8000/v1` |
 | `JUDGE_MODEL` | `DeepSeek-V4.1-Flash-1017`; effort xhigh luôn giữ cố định |
 | `LIMIT` | Rỗng/all/none = toàn bộ; 0 = không chọn sample; số dương = giới hạn chính xác |
-| `BATCH_SIZE` | 8 |
-| `GENERATOR_CONCURRENCY`, `JUDGE_CONCURRENCY` | 2, 2 |
+| `BATCH_SIZE` | 20 |
+| `GENERATOR_CONCURRENCY`, `JUDGE_CONCURRENCY` | 20, 20 |
 | `MAX_OUTPUT_TOKENS` | 32768; cho phép 65536 |
 | `OUTPUT_DIR` | `$PROJECT_ROOT/outputs` |
 | `RUN_ID` | Timestamp giờ Việt Nam + hậu tố ngẫu nhiên nếu không đặt |
@@ -210,14 +228,13 @@ Mọi biến dưới đây có thể export hoặc sửa mặc định ở đầ
 | `GENERATOR_THINKING_MODE` | none / deepseek_vllm_xhigh |
 | `JUDGE_RESPONSE_FORMAT` | json_schema / json_object, không tự fallback |
 | `GENERATOR_API_KEY`, `JUDGE_API_KEY` | EMPTY nếu endpoint không yêu cầu key |
-| `PYTHON_BIN` | `$PROJECT_ROOT/.venv/bin/python` |
 
 ## Kiểm thử và giới hạn xác minh
 
 ```bash
-.venv/bin/python -m pytest -q
+python -m pytest -q
 bash -n scripts/run_application.sh
-.venv/bin/python -m compileall -q src
+python -m compileall -q src
 ```
 
 Unit/integration tests dùng httpx.MockTransport; network thật bị chặn trong tests. Kiểm tra schema/fallback, chống leakage trong prompt, format từng issue, đầy đủ reference cho Judge, công thức, review/null, Final Order từ phán quyết từng issue, LIMIT >1000/0, batch cuối, concurrency và out-of-order mapping, retries, resume, crash tail, chống duplicate và artifacts JSONL. Tests không xác minh chất lượng phán đoán pháp lý của Judge thật, khả năng endpoint hỗ trợ json_schema + reasoning parser, tên checkpoint generator, context window hay throughput trên B200. Cần kiểm tra các điểm đó bằng smoke run 1–5 samples trên runtime được chỉ định trước khi chạy full.
