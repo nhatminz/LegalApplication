@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import json
 import logging
+import os
+import tempfile
+from pathlib import Path
 
 from tqdm import tqdm
 
@@ -27,6 +33,56 @@ class StatisticPipeline(Pipeline):
         self.input_count = 0
         self.attempted_docs = set()
         self.saved_count = 0
+        self.input_errors = []
+        self.input_valid_count = 0
+
+    def _record_input_errors(self, store) -> None:
+        known = {(e.get("input_index"), e.get("error")) for e in self.errors if e.get("stage") == "input_validation"}
+        for error in self.input_errors:
+            key = (error.get("input_index"), error["error"])
+            if key not in known:
+                record = {"stage": "input_validation", **error, "timestamp": now()}
+                store.append("errors.jsonl", record)
+                self.errors.append(record)
+                known.add(key)
+
+    def _read_input(self, store):
+        """Validate every source line without editing it; stream rejected bytes to an audit artifact."""
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=".invalid-input-",
+                                             dir=store.path, delete=False) as output:
+                temporary = Path(output.name)
+
+                def rejected(error, raw_line):
+                    try:
+                        text = raw_line.decode("utf-8")
+                    except UnicodeError:
+                        text = None
+                    record = {**error, "stage": "input_validation", "timestamp": now(),
+                              "input_path": str(self.config.input_jsonl), "raw_line": text,
+                              "raw_line_base64": base64.b64encode(raw_line).decode("ascii"),
+                              "raw_line_sha256": hashlib.sha256(raw_line).hexdigest(), "byte_length": len(raw_line)}
+                    output.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+                    log.warning("Statistic skipping invalid input line=%s doc_name=%s error=%s (source unchanged)",
+                                error["input_line"], error["doc_name"], error["error"])
+
+                try:
+                    dataset = read_dataset(self.config.input_jsonl, self.config.limit, skip_invalid=True, on_invalid=rejected)
+                except DatasetError as exc:
+                    self.input_count, self.input_valid_count, self.input_errors = exc.input_count, exc.valid_count, exc.errors
+                    raise
+                finally:
+                    output.flush()
+                    os.fsync(output.fileno())
+            return dataset
+        finally:
+            # Atomic replacement keeps this file one entry per rejected source line on resume.
+            if temporary is not None:
+                try:
+                    os.replace(temporary, store.path / "invalid_input_records.jsonl")
+                finally:
+                    temporary.unlink(missing_ok=True)
 
     def _summary(self, status: str) -> dict:
         samples = self.dataset.samples if self.dataset else []
@@ -36,15 +92,22 @@ class StatisticPipeline(Pipeline):
         processed = len(full) + len(partial)
         complete = self.dataset is not None and processed == len(samples)
         return {"run_id": self.config.run_id, "status": status, "updated_at": now(),
-                "counts": {"input": self.input_count, "selected": len(samples), "attempted": len(self.attempted_docs),
+                "counts": {"input": self.input_count, "input_valid": self.input_valid_count,
+                           "input_invalid": len([e for e in self.input_errors if e.get("input_line") is not None]),
+                           "selected": len(samples), "attempted": len(self.attempted_docs),
                            "processed": processed, "completed": processed, "full": len(full), "partial": len(partial),
                            "failed": len(failed), "pending": len(samples) - processed - len(failed), "skipped": self.saved_count},
                 "ratios": {"full": len(full) / processed if processed else None,
                            "partial": len(partial) / processed if processed else None,
-                           "failed": len(failed) / len(samples) if samples else None},
+                           "failed": len(failed) / len(samples) if samples else None,
+                           "input_invalid": len([e for e in self.input_errors if e.get("input_line") is not None]) / self.input_count if self.input_count else None},
+                "input_validation_errors": self.input_errors,
+                "input_error_log": "invalid_input_records.jsonl",
+                "classified_output_scope": "selected_valid_records",
+                "source_fully_classified": complete and status == "completed" and not self.input_errors and processed == self.input_count,
                 "full_doc_names": full, "partial_doc_names": partial, "failed_doc_names": sorted(failed),
-                "classified_output_complete": complete and status == "completed",
-                "classified_output": "classified_input.jsonl" if complete and status == "completed" else None,
+                "classified_output_complete": complete and status in {"completed", "completed_with_input_errors"},
+                "classified_output": "classified_input.jsonl" if complete and status in {"completed", "completed_with_input_errors"} else None,
                 "partial_output": "classified_input.partial.jsonl" if self.dataset and not complete else None,
                 "judge_model": self.config.judge_model, "mean_score": None}
 
@@ -77,9 +140,8 @@ class StatisticPipeline(Pipeline):
                 if isinstance(exc, DatasetError):
                     summary["input_validation_errors"] = exc.errors
                     summary["counts"]["input"] = exc.input_count
-                    for error in exc.errors:
-                        log.error("Statistic input invalid line=%s error=%s (source unchanged)", error["input_line"], error["error"])
-                        store.append("errors.jsonl", {"stage": "input_validation", **error, "timestamp": now()})
+                    self.errors = store.load("errors.jsonl")
+                    self._record_input_errors(store)
                 if self.dataset is not None:
                     self._export(store, allow_complete=False)
                     summary["partial_output"] = "classified_input.partial.jsonl"
@@ -99,8 +161,9 @@ class StatisticPipeline(Pipeline):
         self.configured = True
         log.info("Statistic start run_id=%s limit=%s batch_size=%d judge=%s thinking=%s", config.run_id,
                  config.limit, config.batch_size, config.judge_model, snapshot["judge_thinking"])
-        dataset = read_dataset(config.input_jsonl, config.limit)  # Deliberately NO clean_input().
+        dataset = self._read_input(store)  # Deliberately NO clean_input() and NO input rewrite.
         self.input_count = dataset.input_count
+        self.input_valid_count, self.input_errors = dataset.valid_count, dataset.validation_errors
         if dataset.sha256 != snapshot["input_sha256"]:
             raise ValueError("Input changed during statistic validation; no API requests made")
         for sample in dataset.samples:
@@ -118,14 +181,19 @@ class StatisticPipeline(Pipeline):
             if labels["classification_status"] != "completed" or any(record.get(k) != v for k, v in labels.items()):
                 raise ValueError("Stored classification differs from raw Judge labels")
         for record in self.errors:
+            if record.get("stage") == "input_validation":
+                if not any(record.get("input_index") == e.get("input_index") and record.get("error") == e["error"] for e in self.input_errors):
+                    raise ValueError("Stored input-validation error no longer matches the source")
+                continue
             if record.get("stage") != "classification":
                 raise ValueError("Stored statistic error has unsupported stage")
             sample = samples.get(record.get("doc_name"))
             if sample is None or any(record.get(k) != v for k, v in sample.identity().items()):
                 raise ValueError("Stored classification error identity mismatch")
         self.dataset = dataset
+        self._record_input_errors(store)
         self.saved_count = len(self.classifications)
-        self.attempted_docs = set(self.classifications) | {e["doc_name"] for e in self.errors}
+        self.attempted_docs = set(self.classifications) | {e["doc_name"] for e in self.errors if e.get("stage") == "classification"}
         # Rebuild only after validating persisted state. Never modify an input source.
         store.summary(self._summary("running"))
         client = APIClient(config, "judge", self.judge_transport)
@@ -136,7 +204,7 @@ class StatisticPipeline(Pipeline):
                       miniters=1, dynamic_ncols=True, disable=None) as progress:
                 progress.set_postfix(full=full_count, partial=partial_count,
                                      failed=len(self.attempted_docs - self.classifications.keys()),
-                                     skipped=self.saved_count, refresh=False)
+                                     skipped=self.saved_count, invalid=len(self.input_errors), refresh=False)
 
                 async def process(sample):
                     nonlocal full_count, partial_count
@@ -154,7 +222,8 @@ class StatisticPipeline(Pipeline):
                         partial_count += int(record["data_status"] == "partial")
                         log.info("Classified doc_name=%s input_index=%d data_status=%s", sample.doc_name, sample.input_index, record["data_status"])
                     progress.set_postfix(full=full_count, partial=partial_count,
-                                         failed=len(self.attempted_docs - self.classifications.keys()), skipped=self.saved_count, refresh=False)
+                                         failed=len(self.attempted_docs - self.classifications.keys()), skipped=self.saved_count,
+                                         invalid=len(self.input_errors), refresh=False)
                     progress.update(1)
 
                 for start in range(0, len(dataset.samples), config.batch_size):
@@ -166,7 +235,10 @@ class StatisticPipeline(Pipeline):
             if file_hash(config.input_jsonl) != dataset.sha256:
                 raise ValueError("Input changed during classification; refusing to publish complete output")
             self._export(store)
-            summary = self._summary("completed" if len(self.classifications) == len(dataset.samples) else "completed_with_errors")
+            status = "completed_with_errors"
+            if len(self.classifications) == len(dataset.samples):
+                status = "completed_with_input_errors" if self.input_errors else "completed"
+            summary = self._summary(status)
             store.summary(summary)
             return summary
         finally:

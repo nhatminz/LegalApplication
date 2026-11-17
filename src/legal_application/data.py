@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from tqdm import tqdm
 
@@ -119,9 +120,12 @@ class Dataset:
     status_counts: dict[str, int] = field(default_factory=dict)
     eligible_count: int = 0
     filtered_out: int = 0
+    valid_count: int = 0
+    validation_errors: list[dict] = field(default_factory=list)
 
 
-def read_dataset(path: Path, limit: int | None, data_status_used: str | None = None) -> Dataset:
+def read_dataset(path: Path, limit: int | None, data_status_used: str | None = None, *,
+                 skip_invalid: bool = False, on_invalid: Callable[[dict, bytes], None] | None = None) -> Dataset:
     """Validate every line, including those beyond LIMIT; retain only selected samples."""
     selected, errors, seen = [], [], set()
     count = valid = 0
@@ -135,9 +139,14 @@ def read_dataset(path: Path, limit: int | None, data_status_used: str | None = N
         for index, line in enumerate(handle):
             count += 1
             digest.update(line)
+            raw = None
+            validation_stage = "json"
             try:
-                sample = parse_sample(strict_json(line.decode("utf-8")), index)
+                raw = strict_json(line.decode("utf-8"))
+                validation_stage = "schema"
+                sample = parse_sample(raw, index)
                 if sample.doc_name in seen:
+                    validation_stage = "duplicate_doc_name"
                     raise ValueError(f"duplicate doc_name {sample.doc_name!r}")
                 seen.add(sample.doc_name)
                 status = sample.raw.get("data_status")
@@ -152,12 +161,17 @@ def read_dataset(path: Path, limit: int | None, data_status_used: str | None = N
                 if included and (limit is None or len(selected) < limit):
                     selected.append(sample)
             except (ValueError, UnicodeError) as exc:
-                errors.append({"input_index": index, "input_line": index + 1, "error": str(exc)})
+                error = {"input_index": index, "input_line": index + 1, "error": str(exc),
+                         "validation_stage": validation_stage, "error_type": type(exc).__name__,
+                         "doc_name": raw.get("doc_name") if isinstance(raw, dict) and isinstance(raw.get("doc_name"), str) else None}
+                errors.append(error)
+                if on_invalid is not None:
+                    on_invalid(error, line)
             progress.set_postfix(valid=valid, errors=len(errors), refresh=False)
             progress.update(len(line))
     if not count:
         errors.append({"input_line": None, "error": "Input JSONL is empty"})
-    if errors:
+    if errors and (not skip_invalid or not valid):
         raise DatasetError(errors, count, valid)
-    return Dataset(selected, count, digest.hexdigest(), status_counts, eligible, filtered_out)
+    return Dataset(selected, count, digest.hexdigest(), status_counts, eligible, filtered_out, valid, errors)
 

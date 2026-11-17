@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from copy import deepcopy
 from dataclasses import replace
@@ -77,7 +78,7 @@ def test_full_paraphrase_and_partial_missing_decisive_evidence(config_factory):
     summary = run(config, handler_for([full, partial], partial_docs={"1801778"}))
     assert summary["counts"]["processed"] == 2
     assert summary["counts"]["full"] == summary["counts"]["partial"] == 1
-    assert summary["ratios"] == {"full": 0.5, "partial": 0.5, "failed": 0.0}
+    assert summary["ratios"] == {"full": 0.5, "partial": 0.5, "failed": 0.0, "input_invalid": 0.0}
     assert summary["classified_output_complete"] is True
     output = read_jsonl(config.run_dir / "classified_input.jsonl")
     assert output == [{**full, "data_status": "full"}, {**partial, "data_status": "partial"}]
@@ -160,7 +161,7 @@ def test_api_failure_no_fake_label_partial_file_then_resume(config_factory):
 
     summary = run(config, broken)
     assert summary["counts"]["processed"] == summary["counts"]["failed"] == 1
-    assert summary["ratios"] == {"full": 1.0, "partial": 0.0, "failed": 0.5}
+    assert summary["ratios"] == {"full": 1.0, "partial": 0.0, "failed": 0.5, "input_invalid": 0.0}
     assert not summary["classified_output_complete"]
     assert not (config.run_dir / "classified_input.jsonl").exists()
     assert [r["doc_name"] for r in read_jsonl(config.run_dir / "classified_input.partial.jsonl")] == ["good"]
@@ -198,14 +199,90 @@ def test_statistic_invalid_input_reports_and_preserves_source(config_factory, ba
     with config.input_jsonl.open("ab") as output:
         output.write(bad)
     original, stamp = config.input_jsonl.read_bytes(), config.input_jsonl.stat().st_mtime_ns
-    with pytest.raises(DatasetError):
-        run(config, lambda request: pytest.fail("No model requests for invalid statistic input"))
+    summary = run(config, handler_for([raw]))
     assert config.input_jsonl.read_bytes() == original and config.input_jsonl.stat().st_mtime_ns == stamp
     assert not config.input_jsonl.with_name(config.input_jsonl.name + ".cleanup.lock").exists()
-    assert not (config.run_dir / "classified_input.jsonl").exists()
-    summary = json.loads((config.run_dir / "summary.json").read_text())
+    assert summary["status"] == "completed_with_input_errors"
+    assert summary["counts"]["input"] == 2 and summary["counts"]["input_valid"] == 1
+    assert summary["counts"]["input_invalid"] == summary["counts"]["processed"] == 1
+    assert summary["counts"]["failed"] == 0
+    assert summary["classified_output_complete"] and not summary["source_fully_classified"]
+    assert len(read_jsonl(config.run_dir / "classified_input.jsonl")) == 1
     assert summary["input_validation_errors"][0]["input_line"] == 2
     assert read_jsonl(config.run_dir / "errors.jsonl")[0]["stage"] == "input_validation"
+    entry = read_jsonl(config.run_dir / "invalid_input_records.jsonl")[0]
+    assert base64.b64decode(entry["raw_line_base64"]) == bad
+    assert entry["input_line"] == 2
+    # Resume never repeats successful inference or duplicates source error entries.
+    resumed = run(replace(config, resume=True), lambda request: pytest.fail("Saved valid record must be skipped"))
+    assert resumed["counts"]["skipped"] == 1
+    assert len(read_jsonl(config.run_dir / "errors.jsonl")) == 1
+    assert len(read_jsonl(config.run_dir / "invalid_input_records.jsonl")) == 1
+
+
+def test_reported_2010_records_line_578_is_skipped_with_original_indices(config_factory):
+    records = [source(f"case-{i}", n=1) for i in range(2010)]
+    records[577]["issues"] = []
+    config = config_factory(records, mode="statistic", batch_size=50, judge_concurrency=50, max_output_tokens=65536)
+    before, stamp = config.input_jsonl.read_bytes(), config.input_jsonl.stat().st_mtime_ns
+    summary = run(config, handler_for(records))
+    assert summary["counts"]["input"] == 2010
+    assert summary["counts"]["input_valid"] == summary["counts"]["selected"] == summary["counts"]["processed"] == 2009
+    assert summary["counts"]["input_invalid"] == 1
+    assert summary["counts"]["failed"] == 0
+    assert summary["classified_output_complete"] and not summary["source_fully_classified"]
+    output = read_jsonl(config.run_dir / "classified_input.jsonl")
+    assert len(output) == 2009 and output[577]["doc_name"] == "case-578"
+    details = read_jsonl(config.run_dir / "classification_details.jsonl")
+    assert details[577]["input_index"] == 578 and details[577]["input_line"] == 579
+    assert config.input_jsonl.read_bytes() == before and config.input_jsonl.stat().st_mtime_ns == stamp
+    rejected = read_jsonl(config.run_dir / "invalid_input_records.jsonl")[0]
+    assert rejected["input_line"] == 578 and rejected["error"] == "issues must be a nonempty list"
+
+
+def test_invalid_records_before_limit_do_not_consume_selection(config_factory):
+    bad = source("bad")
+    bad["issues"] = []
+    records = [bad, source("first-valid"), source("second-valid")]
+    config = config_factory(records, mode="statistic", limit=2)
+    summary = run(config, handler_for(records))
+    assert summary["counts"]["selected"] == summary["counts"]["processed"] == 2
+    assert [r["input_index"] for r in read_jsonl(config.run_dir / "classification_details.jsonl")] == [1, 2]
+
+
+@pytest.mark.parametrize("contents", [b"broken\n", b'{"doc_name":"no-fields"}\n', b""])
+def test_no_valid_statistic_records_reports_error_without_model_calls(config_factory, contents):
+    config = config_factory([source()], mode="statistic")
+    config.input_jsonl.write_bytes(contents)
+    with pytest.raises(DatasetError):
+        run(config, lambda request: pytest.fail("No model calls if no valid samples remain"))
+    assert config.input_jsonl.read_bytes() == contents
+    assert not (config.run_dir / "classified_input.jsonl").exists()
+    summary = json.loads((config.run_dir / "summary.json").read_text())
+    assert not summary["classified_output_complete"]
+    assert summary["counts"]["processed"] == 0
+
+
+def test_invalid_source_and_failed_judge_are_counted_separately(config_factory):
+    good, failed = source("good"), source("failed")
+    config = config_factory([good, failed], mode="statistic", api_max_retries=0)
+    with config.input_jsonl.open("ab") as output:
+        output.write(b"bad-json\n")
+    normal = handler_for([good, failed])
+
+    def handler(request):
+        doc = json.loads(json.loads(request.content)["messages"][1]["content"])["doc_name"]
+        return httpx.Response(503) if doc == "failed" else normal(request)
+
+    summary = run(config, handler)
+    assert summary["counts"]["input_invalid"] == summary["counts"]["failed"] == 1
+    assert summary["counts"]["processed"] == 1 and summary["counts"]["selected"] == 2
+    assert summary["ratios"]["failed"] == 0.5
+    assert summary["ratios"]["input_invalid"] == pytest.approx(1/3)
+    assert not (config.run_dir / "classified_input.jsonl").exists()
+    resumed = run(replace(config, resume=True), normal)
+    assert resumed["counts"]["input_invalid"] == 1 and resumed["counts"]["failed"] == 0
+    assert resumed["classified_output_complete"]
 
 
 def test_classification_concurrency_and_export_order(config_factory):

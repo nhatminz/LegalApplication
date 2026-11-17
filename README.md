@@ -10,7 +10,7 @@ Judge đọc đầy đủ nguồn tham chiếu, suy ra kết quả từng issue 
 
 Chạy `scripts/statistic.sh` trên JSONL gốc **chưa có data_status** để phân loại độ đầy đủ của facts_clean theo tất cả issues. Judge đọc facts_clean, issues, application/conclusion và facts riêng để kiểm chứng. `full` nghĩa dữ kiện thực tế đủ để giải quyết mọi issue; `partial` nghĩa ít nhất một issue thiếu tình tiết/chứng cứ quyết định được Tòa sử dụng. Diễn đạt tương đương hoặc suy ra hợp lý vẫn được coi là đã có dữ kiện. Thiếu lập luận pháp luật/trích dẫn luật không phải thiếu facts. Prompt phân loại nằm riêng, không sửa prompts Application hay công thức LEGIT.
 
-Statistic **không gọi clean_input và không sửa input gốc**. JSON/schema lỗi làm preflight báo lỗi và lưu errors.jsonl; bạn sửa dữ liệu nguồn rồi dùng run mới. Nếu input đã có data_status, dùng bản input gốc chưa gắn nhãn để tránh ghi đè giá trị cũ.
+Statistic **không gọi clean_input và không sửa input gốc**. JSON/schema lỗi (kể cả issues rỗng như dòng 578) được báo warning, lưu riêng vào invalid_input_records.jsonl/errors.jsonl và **bỏ qua để tiếp tục phân loại các records hợp lệ phía sau**. LIMIT chỉ tính records hợp lệ; số dòng gốc không bị đánh lại trong classification_details. Nếu không còn record hợp lệ thì báo lỗi và không gọi Judge. Nếu input đã có data_status, dùng bản input gốc chưa gắn nhãn để tránh ghi đè giá trị cũ.
 
 ```bash
 export PROJECT_ROOT="${PROJECT_ROOT:-/workspace/storage-shared/nlp/minhpn19/LegalApplication}"
@@ -26,9 +26,9 @@ INPUT_JSONL="$PROJECT_ROOT/input/judgment_with_issues_sample.jsonl" \
 python -m json.tool "$OUTPUT_DIR/$STAT_RUN_ID/summary.json"
 ```
 
-Artifacts: `classification_details.jsonl` có lý do, phân tích đủ issues, facts thiếu, trích dẫn nguồn, raw Judge response và metadata; `summary.json` có input/selected/processed/full/partial/failed, tỷ lệ và doc_names; `errors.jsonl` có lỗi; `run.log` ghi tiến trình. Các quotes phải là substring nguyên văn của đúng trường nguồn; mapping, nhãn và tính nhất quán full/partial được validate và retry. Kiểm tra quote không thay thế đánh giá tương đương ngữ nghĩa do Judge thực hiện.
+Artifacts: `classification_details.jsonl` có lý do, phân tích đủ issues, facts thiếu, trích dẫn nguồn, raw Judge response và metadata; `summary.json` có input/input_valid/input_invalid/selected/processed/full/partial/failed, tỷ lệ và doc_names; `errors.jsonl` có lỗi; `invalid_input_records.jsonl` giữ nguyên dòng nguồn bị bỏ qua dưới dạng text/base64 cùng số dòng, doc_name, lý do và checksum; `run.log` ghi tiến trình. Các quotes phải là substring nguyên văn của đúng trường nguồn; mapping, nhãn và tính nhất quán full/partial được validate và retry. Kiểm tra quote không thay thế đánh giá tương đương ngữ nghĩa do Judge thực hiện.
 
-Chỉ khi **toàn bộ selected samples** phân loại thành công, pipeline mới xuất `classified_input.jsonl` theo thứ tự input, giữ nguyên mọi field/value và chỉ thêm data_status. Nếu còn lỗi, không xuất file hoàn chỉnh; các kết quả thành công nằm trong `classified_input.partial.jsonl`, `classified_output_complete=false`. Lỗi API/không phân loại được không bao giờ được gán partial. Tỷ lệ full/partial tính trên processed thành công; tỷ lệ failed tính trên selected. LIMIT rỗng/all không có hidden cap; LIMIT hữu hạn xuất đúng selected subset và không chứng nhận toàn bộ input chưa chọn.
+Chỉ khi **toàn bộ selected samples hợp lệ** phân loại thành công, pipeline mới xuất `classified_input.jsonl` theo thứ tự input, giữ nguyên mọi field/value của các records đó và chỉ thêm data_status. Record input lỗi không được xuất hoặc gán nhãn giả. Nếu còn lỗi Judge, các kết quả thành công nằm trong `classified_input.partial.jsonl`, `classified_output_complete=false`. Lỗi API/không phân loại được không bao giờ được gán partial. Tỷ lệ full/partial tính trên processed thành công; tỷ lệ failed tính trên selected; tỷ lệ input_invalid tính riêng trên tổng dòng input. LIMIT rỗng/all không có hidden cap; LIMIT hữu hạn xuất đúng selected subset. `classified_output_complete=true` nghĩa hoàn tất tập **selected_valid_records**, không chứng nhận các dòng input lỗi; `source_fully_classified` chỉ true khi toàn bộ file nguồn đều hợp lệ và đã phân loại xong. Run hoàn tất với dòng nguồn bị bỏ qua có status=completed_with_input_errors và vẫn xuất kết quả của records hợp lệ.
 
 Resume statistic với **cùng cấu hình, input và RUN_ID**; chỉ gọi lại samples chưa thành công:
 
@@ -100,7 +100,7 @@ MODE=validate-only RUN_ID=schema-check \
   bash "$PROJECT_ROOT/scripts/run_application.sh"
 ```
 
-Tệp mẫu gốc trong repository có 6 records hợp lệ nhưng chưa có data_status; cần phân loại bằng statistic trước. Bản raw có JSON/schema lỗi sẽ được statistic báo cáo và giữ nguyên; Application vẫn có cleanup như mô tả trên sau khi input có nhãn hợp lệ. Xem `counts.input_removed` trong summary để biết số dòng bị xóa. Để smoke test riêng 1–5 bản án, có thể tạo một tệp con chứa 5 dòng đầu của INPUT_JSONL đã gắn nhãn:
+Tệp mẫu gốc trong repository có 6 records hợp lệ nhưng chưa có data_status; cần phân loại bằng statistic trước. Bản raw có JSON/schema lỗi sẽ được statistic báo cáo, bỏ qua và giữ nguyên nguồn; Application vẫn có cleanup như mô tả trên sau khi input có nhãn hợp lệ. Xem `counts.input_invalid` của statistic để biết số dòng nguồn bị bỏ qua; `counts.input_removed` của Application là số dòng bị xóa ở cơ chế cleanup riêng. Để smoke test riêng 1–5 bản án, có thể tạo một tệp con chứa 5 dòng đầu của INPUT_JSONL đã gắn nhãn:
 
 ```bash
 python - <<'PY'

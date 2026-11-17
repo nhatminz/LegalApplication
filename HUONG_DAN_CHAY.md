@@ -31,7 +31,7 @@ Các bước sau giả định terminal đã dùng đúng môi trường này.
 
 ### 1.1. Terminal 2: phân loại dữ liệu trước khi chạy Application
 
-Statistic chỉ cần Judge endpoint, không cần host Qwen. Chạy trên input gốc chưa có data_status; toàn bộ file nguồn được giữ nguyên. JSON/schema lỗi được báo và làm preflight dừng, không gọi clean_input để sửa nguồn.
+Statistic chỉ cần Judge endpoint, không cần host Qwen. Chạy trên input gốc chưa có data_status; toàn bộ file nguồn được giữ nguyên. JSON/schema lỗi (ví dụ issues rỗng ở dòng 578) được ghi vào invalid_input_records.jsonl/errors.jsonl rồi bỏ qua; tiếp tục với các records hợp lệ. Statistic không gọi clean_input để sửa nguồn và không gán partial cho record lỗi. Nếu tất cả records đều lỗi hoặc file rỗng thì dừng trước API.
 
 ```bash
 export PROJECT_ROOT=/workspace/storage-shared/nlp/minhpn19/LegalApplication
@@ -61,7 +61,7 @@ python -m json.tool "$OUTPUT_DIR/$STAT_RUN_ID/summary.json"
 
 `full`: facts_clean đủ dữ kiện thực tế cho mọi issue đã được Tòa giải quyết; `partial`: ít nhất một issue thiếu tình tiết/chứng cứ quyết định trong application/conclusion. Diễn đạt tương đương hoặc thiếu diễn giải pháp luật không tự làm sample partial. Details có phân tích đủ issues và quotes được kiểm tra nguyên văn với đúng nguồn.
 
-Chỉ tiếp tục Application khi `classified_output_complete=true`. Nếu còn API/schema/evidence errors hoặc Judge không phân loại được, kết quả thành công được lưu vào `classified_input.partial.jsonl`, lỗi vào errors.jsonl; không có nhãn giả và không có classified_input.jsonl hoàn chỉnh. Tỷ lệ full/partial dùng số phân loại thành công làm mẫu số; tỷ lệ lỗi báo riêng trên selected. Resume bằng đúng exports và STAT_RUN_ID ở trên:
+Chỉ tiếp tục Application khi `classified_output_complete=true`, tức đã hoàn tất tập **selected records hợp lệ**. Summary báo input/input_valid/input_invalid riêng; LIMIT được áp dụng lên records hợp lệ. `source_fully_classified=false` nếu còn dòng input lỗi bị bỏ qua hoặc chưa chọn hết nguồn. Các dòng lỗi không nằm trong output có nhãn. Nếu còn API/JSON/schema/evidence errors của Judge hoặc Judge không phân loại được, kết quả thành công được lưu vào `classified_input.partial.jsonl`, lỗi vào errors.jsonl; không có nhãn giả và không có classified_input.jsonl hoàn chỉnh. Tỷ lệ full/partial dùng số phân loại thành công làm mẫu số; tỷ lệ lỗi Judge báo riêng trên selected, input_invalid báo riêng trên tổng input. Resume bằng đúng exports và STAT_RUN_ID ở trên:
 
 ```bash
 INPUT_JSONL="$RAW_INPUT_JSONL" RUN_ID="$STAT_RUN_ID" LIMIT=all RESUME=1 \
@@ -69,6 +69,21 @@ INPUT_JSONL="$RAW_INPUT_JSONL" RUN_ID="$STAT_RUN_ID" LIMIT=all RESUME=1 \
 ```
 
 Khi toàn bộ selected samples thành công, file classified_input.jsonl giữ nguyên toàn bộ object gốc, chỉ thêm data_status, theo đúng thứ tự input. LIMIT=all phân loại toàn bộ; nếu chỉ thử LIMIT=5 thì file hoàn chỉnh chỉ bao gồm 5 samples được chọn, không phải toàn dataset. Dùng RUN_ID mới nếu đổi LIMIT.
+
+Ví dụ nguồn 2.010 dòng có một record issues rỗng tại dòng 578: counts.input=2010, input_valid=2009, input_invalid=1; với LIMIT=all có selected=2009. Khi 2.009 records này phân loại thành công, output có 2.009 records, classified_output_complete=true nhưng source_fully_classified=false. classification_details giữ input_index/input_line của nguồn gốc (có khoảng trống ở dòng lỗi); Application sau đó đánh số theo file classified_input.jsonl mới. Dùng doc_name để đối chiếu giữa hai giai đoạn.
+
+Đọc log records nguồn bị bỏ qua, không cần sửa input:
+
+```bash
+python - "$OUTPUT_DIR/$STAT_RUN_ID/invalid_input_records.jsonl" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for line in handle:
+        row = json.loads(line)
+        print(row["input_line"], row["doc_name"], row["error"])
+PY
+```
 
 Sau khi hoàn tất, đặt input Application từ chính run phân loại này:
 
