@@ -54,7 +54,7 @@ class Config:
     @classmethod
     def from_env(cls) -> Config:
         e = os.environ
-        root = Path(e.get("PROJECT_ROOT", "/workspace/storage-shared/nlp/minhpn19/LegalApplication")).expanduser().resolve()
+        root = Path(e.get("PROJECT_ROOT", "/workspace/storage-shared/nlp/users/minhpn19/LegalApplication")).expanduser().resolve()
         run_id = e.get("RUN_ID") or datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).strftime("%Y%m%dT%H%M%S") + "_" + uuid4().hex[:8]
         limit = e.get("LIMIT", "").strip()
         source = e.get("GENERATION_JSONL", "")

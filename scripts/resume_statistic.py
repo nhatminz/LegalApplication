@@ -1,4 +1,4 @@
-"""Resume a statistic run with explicitly changed scheduling only.
+"""Resume a statistic run after scheduling changes or an explicit project relocation.
 
 Kept outside src/legal_application so installing this helper does not change the
 pipeline implementation hash of a run that is already in progress.
@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import os
 import re
 import sys
@@ -19,9 +20,31 @@ from legal_application.storage import append_jsonl, atomic_json, file_hash, impl
 from legal_application.data import strict_json
 from legal_application.thinking import resolve_thinking
 
+LEGACY_PROJECT_ROOT = "/workspace/storage-shared/nlp/minhpn19/LegalApplication"
+DEFAULT_PROJECT_ROOT = "/workspace/storage-shared/nlp/users/minhpn19/LegalApplication"
+
+
+def path_default_compatibility_hashes() -> set[str]:
+    """Recognize ONLY the previous default-path literal, not arbitrary code changes."""
+    import legal_application.config as config_module
+
+    package = Path(config_module.__file__).parent
+    digest = hashlib.sha256()
+    for path in sorted(p for p in package.rglob("*") if p.suffix in {".py", ".txt", ".json"}):
+        data = path.read_bytes()
+        if path == package / "config.py":
+            old, new = LEGACY_PROJECT_ROOT.encode(), DEFAULT_PROJECT_ROOT.encode()
+            if data.count(new) != 1:
+                return set()
+            data = data.replace(new, old, 1)
+        digest.update(str(path.relative_to(package)).encode())
+        digest.update(data)
+    return {digest.hexdigest()}
+
 
 def prepare_resume(root: Path, output_dir: Path, run_id: str, *, batch_size: int | None = None,
-                   judge_concurrency: int | None = None) -> dict:
+                   judge_concurrency: int | None = None, relocate: bool = False,
+                   input_jsonl: Path | None = None) -> dict:
     if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", run_id):
         raise ValueError("Provide the existing RUN_ID; do not generate a new one")
     for name, value in [("BATCH_SIZE", batch_size), ("JUDGE_CONCURRENCY", judge_concurrency)]:
@@ -40,9 +63,22 @@ def prepare_resume(root: Path, output_dir: Path, run_id: str, *, batch_size: int
         saved = strict_json(config_path.read_text())
         if saved.get("pipeline_kind") != "data_completeness" or saved.get("mode") != "statistic":
             raise ValueError("This helper supports statistic runs only")
-        if saved.get("run_id") != run_id or Path(saved["project_root"]).resolve() != root or Path(saved["output_dir"]).resolve() != output_dir:
-            raise ValueError("PROJECT_ROOT, OUTPUT_DIR and RUN_ID must point to the original run")
+        if saved.get("run_id") != run_id:
+            raise ValueError("RUN_ID does not match config.json")
+        old_root = Path(saved["project_root"]).resolve()
+        if not relocate and (old_root != root or Path(saved["output_dir"]).resolve() != output_dir):
+            raise ValueError("Project/run path changed. Use --relocate with the NEW PROJECT_ROOT and OUTPUT_DIR")
+        if input_jsonl is not None and not relocate:
+            raise ValueError("--input-jsonl requires --relocate; input checksum must remain unchanged")
         updated = dict(saved)
+        if relocate:
+            updated.update(project_root=str(root), output_dir=str(output_dir))
+            old_input = Path(saved["input_jsonl"])
+            if input_jsonl is not None:
+                updated["input_jsonl"] = str(rooted(root, str(input_jsonl)))
+            elif old_input.is_relative_to(old_root):
+                updated["input_jsonl"] = str((root / old_input.relative_to(old_root)).resolve())
+            # Inputs outside the old project (e.g. LegalDataset) keep their original path.
         if batch_size is not None:
             updated["batch_size"] = batch_size
         if judge_concurrency is not None:
@@ -60,15 +96,22 @@ def prepare_resume(root: Path, output_dir: Path, run_id: str, *, batch_size: int
         expected.update(pipeline_kind="data_completeness", artifact_version=1,
                         input_sha256=file_hash(config.input_jsonl), implementation_sha256=implementation_hash(),
                         judge_thinking=resolve_thinking(config.judge_thinking_mode))
+        if updated.get("implementation_sha256") != expected["implementation_sha256"]:
+            if relocate and updated.get("implementation_sha256") in path_default_compatibility_hashes():
+                updated["implementation_sha256"] = expected["implementation_sha256"]
+            else:
+                raise ValueError("Pipeline code differs from the run. Relocation can migrate only the verified default-path change")
         if expected != updated:
-            raise ValueError("Input/code/config differs from the saved run. Only batch size and Judge concurrency may change")
+            raise ValueError("Input/config differs from the saved run. Input bytes, Judge and evaluation settings must remain unchanged")
         changes = {key: {"old": saved[key], "new": updated[key]}
-                   for key in ["batch_size", "judge_concurrency"] if saved[key] != updated[key]}
+                   for key in ["project_root", "output_dir", "input_jsonl", "implementation_sha256", "batch_size", "judge_concurrency"]
+                   if saved[key] != updated[key]}
         if changes:
             change_id = uuid4().hex
             backup = run_dir / f"config.before-resume-{change_id}.json"
             atomic_json(backup, saved)
-            event = {"change_id": change_id, "timestamp": now(), "changes": changes, "backup": backup.name}
+            event = {"change_id": change_id, "timestamp": now(), "changes": changes, "backup": backup.name,
+                     "relocate": relocate, "input_checksum_verified": True}
             append_jsonl(run_dir / "resume_config_changes.jsonl", {**event, "state": "prepared"})
             atomic_json(config_path, updated)
             append_jsonl(run_dir / "resume_config_changes.jsonl", {**event, "state": "applied"})
@@ -92,16 +135,18 @@ def resume_environment(snapshot: dict) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Resume statistic; change only batch size and Judge concurrency")
+    parser = argparse.ArgumentParser(description="Resume statistic with checked scheduling changes or project relocation")
     parser.add_argument("run_id", nargs="?", default=os.environ.get("RUN_ID"))
     parser.add_argument("--batch-size", type=int, default=os.environ.get("BATCH_SIZE"))
     parser.add_argument("--judge-concurrency", type=int, default=os.environ.get("JUDGE_CONCURRENCY"))
+    parser.add_argument("--relocate", action="store_true", help="Update saved project/output paths to the current location")
+    parser.add_argument("--input-jsonl", type=Path, help="New input location, allowed only with --relocate and identical file checksum")
     args = parser.parse_args()
     try:
-        root = Path(os.environ.get("PROJECT_ROOT", "/workspace/storage-shared/nlp/minhpn19/LegalApplication")).resolve()
+        root = Path(os.environ.get("PROJECT_ROOT", DEFAULT_PROJECT_ROOT)).resolve()
         output = rooted(root, os.environ.get("OUTPUT_DIR", "outputs"))
         snapshot = prepare_resume(root, output, args.run_id, batch_size=args.batch_size,
-                                  judge_concurrency=args.judge_concurrency)
+                                  judge_concurrency=args.judge_concurrency, relocate=args.relocate, input_jsonl=args.input_jsonl)
     except (ValueError, OSError) as exc:
         print(f"Resume aborted: {exc}", file=sys.stderr)
         return 2

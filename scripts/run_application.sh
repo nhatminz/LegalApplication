@@ -18,7 +18,7 @@ export GENERATOR_API_KEY="${GENERATOR_API_KEY:-EMPTY}"
 export GENERATOR_THINKING_MODE="${GENERATOR_THINKING_MODE:-none}"
 
 # Runtime paths are based on PROJECT_ROOT. Relative path exports also resolve from it.
-export PROJECT_ROOT="${PROJECT_ROOT:-/workspace/storage-shared/nlp/minhpn19/LegalApplication}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/workspace/storage-shared/nlp/users/minhpn19/LegalApplication}"
 # Record JSON/schema lỗi (kể cả issues rỗng) được ghi log rồi xóa khỏi INPUT_JSONL.
 export INPUT_JSONL="${INPUT_JSONL:-${PROJECT_ROOT}/input/judgment_with_issues_sample.jsonl}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs}"

@@ -9,7 +9,7 @@ Ví dụ xuyên suốt dùng checkpoint local:
 Repository runtime:
 
 ```text
-/workspace/storage-shared/nlp/minhpn19/LegalApplication
+/workspace/storage-shared/nlp/users/minhpn19/LegalApplication
 ```
 
 Bạn dùng môi trường `.venv` đã cài đầy đủ thư viện, đặt ở bất kỳ đâu. Các lệnh gọi `python` và `vllm` từ môi trường đã activate. Chạy các bước có inference trên B200.
@@ -34,7 +34,7 @@ Các bước sau giả định terminal đã dùng đúng môi trường này.
 Statistic chỉ cần Judge endpoint, không cần host Qwen. Chạy trên input gốc chưa có data_status; toàn bộ file nguồn được giữ nguyên. JSON/schema lỗi (ví dụ issues rỗng ở dòng 578) được ghi vào invalid_input_records.jsonl/errors.jsonl rồi bỏ qua; tiếp tục với các records hợp lệ. Statistic không gọi clean_input để sửa nguồn và không gán partial cho record lỗi. Nếu tất cả records đều lỗi hoặc file rỗng thì dừng trước API.
 
 ```bash
-export PROJECT_ROOT=/workspace/storage-shared/nlp/minhpn19/LegalApplication
+export PROJECT_ROOT=/workspace/storage-shared/nlp/users/minhpn19/LegalApplication
 cd "$PROJECT_ROOT"
 export OUTPUT_DIR="$PROJECT_ROOT/outputs"
 export RAW_INPUT_JSONL="$PROJECT_ROOT/input/judgment_with_issues_sample.jsonl"
@@ -68,10 +68,11 @@ INPUT_JSONL="$RAW_INPUT_JSONL" RUN_ID="$STAT_RUN_ID" LIMIT=all RESUME=1 \
   bash scripts/statistic.sh
 ```
 
-Nếu muốn tăng số samples đồng thời của **run statistic đang chạy**, nhấn Ctrl-C và đợi lệnh cũ thoát. Cập nhật hai file scripts/resume_statistic.sh và scripts/resume_statistic.py lên B200 (không cần đổi package pipeline đang dùng), rồi chạy trong môi trường .venv đã activate:
+Nếu muốn tăng số samples đồng thời của **run statistic đang chạy**, nhấn Ctrl-C và đợi lệnh cũ thoát. Cập nhật hai file scripts/resume_statistic.sh và scripts/resume_statistic.py lên B200 rồi chạy trong môi trường .venv đã activate. Nếu project vẫn ở vị trí đã lưu trong config, chỉ cập nhật hai helper là đủ:
 
 ```bash
-export PROJECT_ROOT=/workspace/storage-shared/nlp/minhpn19/LegalApplication
+export PROJECT_ROOT=/workspace/storage-shared/nlp/users/minhpn19/LegalApplication
+export OUTPUT_DIR="$PROJECT_ROOT/outputs"
 cd "$PROJECT_ROOT"
 
 # Thay TEN_RUN_DANG_CHAY bằng RUN_ID thật của run vừa dừng, không tạo ID mới.
@@ -80,6 +81,35 @@ bash scripts/resume_statistic.sh TEN_RUN_DANG_CHAY \
 ```
 
 Nếu đang dùng OUTPUT_DIR khác mặc định, export lại OUTPUT_DIR đó trước lệnh trên. Helper tự đọc các giá trị gốc trong config.json, kể cả MAX_OUTPUT_TOKENS=65536 nếu run ban đầu dùng mức đó; chỉ đổi batch và Judge concurrency. Cấu hình cũ được backup, thay đổi được ghi vào resume_config_changes.jsonl. Các classification_details đã lưu được dùng lại, chỉ samples chưa thành công được gọi lại. Nếu run cũ chưa thoát, helper từ chối để không có hai process cùng ghi. Input, code, model, thinking và các thiết lập nội dung phải tiếp tục khớp run gốc. Tăng concurrency không thay đổi LIMIT hay nhãn đã có. Số request server thực sự chạy song song còn phụ thuộc scheduler/KV cache.
+
+### 1.2. Resume statistic sau khi chuyển thư mục project
+
+Nếu run nằm ở `/workspace/storage-shared/nlp/users/minhpn19/LegalApplication/outputs/20261117T135710_be74ac50` nhưng config.json còn lưu project_root cũ, không đọc path từ config đó để `cd`. Đồng bộ code đã sửa lên project mới, gồm scripts/resume_statistic.sh, scripts/resume_statistic.py và src/legal_application/config.py. Trong terminal đã activate .venv và sau khi process cũ thoát, chạy nguyên khối:
+
+```bash
+export PROJECT_ROOT=/workspace/storage-shared/nlp/users/minhpn19/LegalApplication
+export OUTPUT_DIR="$PROJECT_ROOT/outputs"
+cd "$PROJECT_ROOT"
+
+bash scripts/resume_statistic.sh 20261117T135710_be74ac50 \
+  --relocate \
+  --batch-size 200 \
+  --judge-concurrency 200
+```
+
+Helper kiểm tra input checksum, giữ nguyên RUN_ID/model/thinking/LIMIT và các thiết lập nội dung, sao lưu config thành config.before-resume-*.json, ghi resume_config_changes.jsonl rồi cập nhật project_root/output_dir. Các records đã phân loại thành công được bỏ qua, chỉ gọi Judge cho records chưa thành công. Input bên ngoài project vẫn giữ nguyên đường dẫn, cụ thể `/workspace/storage-shared/nlp/minhpn19/LegalDataset/output/2k_clean_hoi_final/judgment_with_issues.jsonl` trong trường hợp này. Input và classification_details không bị viết lại trong bước chuyển cấu hình. Log lịch sử được giữ nguyên để đối chiếu.
+
+Nếu input cũng chuyển sang nơi khác, thêm option sau vào lệnh resume (thay bằng path thật):
+
+```bash
+bash scripts/resume_statistic.sh 20261117T135710_be74ac50 \
+  --relocate --batch-size 200 --judge-concurrency 200 \
+  --input-jsonl /duong/dan/moi/judgment_with_issues.jsonl
+```
+
+Input nằm trong project cũ được tự đổi sang vị trí tương ứng dưới project mới; --input-jsonl dùng khi muốn chỉ định riêng. Mọi thay đổi input path đều phải giữ nguyên bytes/checksum. Helper nhận diện chính xác phiên bản code chỉ khác giá trị PROJECT_ROOT mặc định để chuyển implementation hash tương ứng; thay đổi code/prompt/schema khác vẫn bị từ chối. Sau lần chuyển đầu, những lần resume tiếp theo không cần --relocate nếu paths giữ nguyên.
+
+### 1.3. Kết quả statistic
 
 Khi toàn bộ selected samples thành công, file classified_input.jsonl giữ nguyên toàn bộ object gốc, chỉ thêm data_status, theo đúng thứ tự input. LIMIT=all phân loại toàn bộ; nếu chỉ thử LIMIT=5 thì file hoàn chỉnh chỉ bao gồm 5 samples được chọn, không phải toàn dataset. Dùng RUN_ID mới nếu đổi LIMIT.
 
@@ -112,7 +142,7 @@ Nếu ở terminal khác, điền đường dẫn classified_input.jsonl thực 
 Ví dụ dùng GPU số 0, port 8001, tên model trên API là `Qwen/Qwen3-4B`.
 
 ```bash
-export PROJECT_ROOT=/workspace/storage-shared/nlp/minhpn19/LegalApplication
+export PROJECT_ROOT=/workspace/storage-shared/nlp/users/minhpn19/LegalApplication
 export MODEL_PATH=/workspace/storage-shared/models/Qwen3-4B
 export MODEL_NAME=Qwen/Qwen3-4B
 
@@ -156,7 +186,7 @@ Input có thể chứa toàn văn luật dài nên ví dụ dùng context 131072
 Sau khi activate môi trường ở terminal 2, copy toàn bộ khối sau:
 
 ```bash
-export PROJECT_ROOT=/workspace/storage-shared/nlp/minhpn19/LegalApplication
+export PROJECT_ROOT=/workspace/storage-shared/nlp/users/minhpn19/LegalApplication
 cd "$PROJECT_ROOT"
 
 # Input đã phân loại ở bước 1.1, bắt buộc data_status full/partial trên mọi record.
@@ -397,7 +427,7 @@ wc -l "$RESULT_DIR/generations.jsonl" "$RESULT_DIR/evaluations.jsonl" "$RESULT_D
 
 ```bash
 # Thay TEN_RUN_THUC_TE bằng tên run bạn muốn theo dõi.
-export RESULT_DIR=/workspace/storage-shared/nlp/minhpn19/LegalApplication/outputs/TEN_RUN_THUC_TE
+export RESULT_DIR=/workspace/storage-shared/nlp/users/minhpn19/LegalApplication/outputs/TEN_RUN_THUC_TE
 tail -n 100 -f "$RESULT_DIR/run.log"
 ```
 
@@ -455,10 +485,10 @@ Resume yêu cầu giữ nguyên model, endpoints, input hợp lệ, LIMIT, batch
 
 ### Khôi phục cấu hình nếu đã đóng terminal cũ
 
-Activate môi trường hiện có, đặt đường dẫn chính xác tới config.json của run cần resume, rồi copy khối dưới. Python chỉ chuyển các giá trị cấu hình đã lưu thành shell exports, không gọi API hoặc kiểm tra phiên bản thư viện.
+Khối dưới dành cho Application khi project vẫn ở vị trí đã lưu trong config. Với statistic, dùng scripts/resume_statistic.sh ở mục 1.1; nếu vừa di chuyển project, dùng --relocate ở mục 1.2 trước khi khôi phục biến từ config cũ. Activate môi trường hiện có, đặt đường dẫn chính xác tới config.json của run cần resume, rồi copy khối dưới. Python chỉ chuyển các giá trị cấu hình đã lưu thành shell exports, không gọi API hoặc kiểm tra phiên bản thư viện.
 
 ```bash
-export PROJECT_ROOT=/workspace/storage-shared/nlp/minhpn19/LegalApplication
+export PROJECT_ROOT=/workspace/storage-shared/nlp/users/minhpn19/LegalApplication
 cd "$PROJECT_ROOT"
 
 # Thay TEN_RUN_THUC_TE bằng tên run cần tiếp tục.

@@ -13,7 +13,7 @@ Chạy `scripts/statistic.sh` trên JSONL gốc **chưa có data_status** để 
 Statistic **không gọi clean_input và không sửa input gốc**. JSON/schema lỗi (kể cả issues rỗng như dòng 578) được báo warning, lưu riêng vào invalid_input_records.jsonl/errors.jsonl và **bỏ qua để tiếp tục phân loại các records hợp lệ phía sau**. LIMIT chỉ tính records hợp lệ; số dòng gốc không bị đánh lại trong classification_details. Nếu không còn record hợp lệ thì báo lỗi và không gọi Judge. Nếu input đã có data_status, dùng bản input gốc chưa gắn nhãn để tránh ghi đè giá trị cũ.
 
 ```bash
-export PROJECT_ROOT="${PROJECT_ROOT:-/workspace/storage-shared/nlp/minhpn19/LegalApplication}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/workspace/storage-shared/nlp/users/minhpn19/LegalApplication}"
 cd "$PROJECT_ROOT"
 export OUTPUT_DIR="$PROJECT_ROOT/outputs"
 export STAT_RUN_ID="completeness-$(TZ=Asia/Ho_Chi_Minh date +%Y%m%d-%H%M%S)-${RANDOM}"
@@ -47,7 +47,19 @@ bash scripts/resume_statistic.sh TEN_RUN_DANG_CHAY \
   --batch-size 200 --judge-concurrency 200
 ```
 
-Helper khôi phục input, LIMIT, Judge, thinking, output budget và các thiết lập còn lại từ config.json; chỉ cập nhật hai giá trị lịch xử lý đã chỉ định, backup cấu hình cũ thành config.before-resume-*.json và ghi resume_config_changes.jsonl. Không sửa input/results, không gọi lại records thành công. Nó từ chối khi process cũ còn giữ lock hoặc input/code khác run gốc. Chỉ cần đồng bộ scripts/resume_statistic.sh và scripts/resume_statistic.py sang runtime; hai helper nằm ngoài package nên không làm đổi implementation hash của pipeline đang dùng. Cơ chế này dành riêng cho statistic; resume thông thường vẫn kiểm tra snapshot nghiêm ngặt.
+Helper khôi phục input, LIMIT, Judge, thinking, output budget và các thiết lập còn lại từ config.json; cập nhật batch/concurrency đã chỉ định, backup cấu hình cũ thành config.before-resume-*.json và ghi resume_config_changes.jsonl. Không sửa input/results, không gọi lại records thành công. Nó từ chối khi process cũ còn giữ lock hoặc input/code khác run gốc. Hai helper nằm ngoài package nên việc chỉ cập nhật chúng không làm đổi implementation hash. Cơ chế này dành riêng cho statistic; resume thông thường vẫn kiểm tra snapshot nghiêm ngặt.
+
+Nếu đã **chuyển project và outputs sang path mới**, đồng bộ code mới lên B200, đặt trực tiếp PROJECT_ROOT/OUTPUT_DIR mới và dùng `--relocate`. Đừng lấy PROJECT_ROOT từ config.json cũ để `cd`, vì file đó vẫn chứa path trước khi di chuyển. Với run `20261117T135710_be74ac50`:
+
+```bash
+export PROJECT_ROOT=/workspace/storage-shared/nlp/users/minhpn19/LegalApplication
+export OUTPUT_DIR="$PROJECT_ROOT/outputs"
+cd "$PROJECT_ROOT"
+bash scripts/resume_statistic.sh 20261117T135710_be74ac50 \
+  --relocate --batch-size 200 --judge-concurrency 200
+```
+
+`--relocate` cập nhật project_root/output_dir trong config đã sao lưu. Input nằm trong project cũ được đổi sang vị trí tương ứng trong project mới; input bên ngoài, như `/workspace/storage-shared/nlp/minhpn19/LegalDataset/output/2k_clean_hoi_final/judgment_with_issues.jsonl`, giữ nguyên path. Nếu input cũng được di chuyển riêng, thêm `--input-jsonl /duong/dan/moi/input.jsonl`; checksum phải khớp tuyệt đối run cũ. Helper chỉ chấp nhận thay đổi implementation hash khi xác minh code chỉ khác đúng giá trị path mặc định trong Config; các thay đổi code/prompt/schema khác vẫn bị từ chối. Cấu hình và nhãn Judge cũ được giữ để đối chiếu trong backup/audit.
 
 Application bây giờ **bắt buộc data_status=full/partial trên mọi record**, kể cả với DATA_STATUS_USED=all và ngoài LIMIT. Thiếu/sai nhãn làm validation thất bại rõ ràng, không đoán hoặc tự xóa record vì lỗi nhãn. Dùng classified_input.jsonl hoàn chỉnh từ statistic:
 
@@ -70,7 +82,7 @@ Client cần Python **>=3.10**, không cần GPU hay PyTorch. Dùng môi trườ
 
 ```bash
 # Activate môi trường .venv hiện có của bạn trước khi chạy các lệnh này.
-export PROJECT_ROOT="${PROJECT_ROOT:-/workspace/storage-shared/nlp/minhpn19/LegalApplication}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/workspace/storage-shared/nlp/users/minhpn19/LegalApplication}"
 cd "$PROJECT_ROOT"
 ```
 
@@ -312,7 +324,7 @@ Mọi biến dưới đây có thể export hoặc sửa mặc định ở đầ
 
 | Biến | Mặc định / ý nghĩa |
 |---|---|
-| `PROJECT_ROOT` | `/workspace/storage-shared/nlp/minhpn19/LegalApplication` |
+| `PROJECT_ROOT` | `/workspace/storage-shared/nlp/users/minhpn19/LegalApplication` |
 | `INPUT_JSONL` | `$PROJECT_ROOT/input/judgment_with_issues_sample.jsonl` |
 | `GENERATOR_BASE_URL`, `GENERATOR_MODEL` | Script điền sẵn `http://127.0.0.1:8001/v1`, `Qwen/Qwen3-4B`; sửa ở đầu script hoặc export để đổi model/server. Python CLI trực tiếp vẫn yêu cầu cấu hình rõ |
 | `JUDGE_BASE_URL` | `http://172.29.62.173:8000/v1` |

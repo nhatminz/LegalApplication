@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Data Completeness Classification: chỉ đọc input, không xóa/sửa file nguồn.
 # Record JSON/schema lỗi được ghi invalid_input_records.jsonl và bỏ qua; tiếp tục với records hợp lệ.
-export PROJECT_ROOT="${PROJECT_ROOT:-/workspace/storage-shared/nlp/minhpn19/LegalApplication}"
+export PROJECT_ROOT="${PROJECT_ROOT:-/workspace/storage-shared/nlp/users/minhpn19/LegalApplication}"
 export INPUT_JSONL="${INPUT_JSONL:-${PROJECT_ROOT}/input/judgment_with_issues_sample.jsonl}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs}"
 export RUN_ID="${RUN_ID:-}"
