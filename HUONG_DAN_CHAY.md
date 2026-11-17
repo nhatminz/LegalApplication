@@ -68,6 +68,19 @@ INPUT_JSONL="$RAW_INPUT_JSONL" RUN_ID="$STAT_RUN_ID" LIMIT=all RESUME=1 \
   bash scripts/statistic.sh
 ```
 
+Nếu muốn tăng số samples đồng thời của **run statistic đang chạy**, nhấn Ctrl-C và đợi lệnh cũ thoát. Cập nhật hai file scripts/resume_statistic.sh và scripts/resume_statistic.py lên B200 (không cần đổi package pipeline đang dùng), rồi chạy trong môi trường .venv đã activate:
+
+```bash
+export PROJECT_ROOT=/workspace/storage-shared/nlp/minhpn19/LegalApplication
+cd "$PROJECT_ROOT"
+
+# Thay TEN_RUN_DANG_CHAY bằng RUN_ID thật của run vừa dừng, không tạo ID mới.
+bash scripts/resume_statistic.sh TEN_RUN_DANG_CHAY \
+  --batch-size 200 --judge-concurrency 200
+```
+
+Nếu đang dùng OUTPUT_DIR khác mặc định, export lại OUTPUT_DIR đó trước lệnh trên. Helper tự đọc các giá trị gốc trong config.json, kể cả MAX_OUTPUT_TOKENS=65536 nếu run ban đầu dùng mức đó; chỉ đổi batch và Judge concurrency. Cấu hình cũ được backup, thay đổi được ghi vào resume_config_changes.jsonl. Các classification_details đã lưu được dùng lại, chỉ samples chưa thành công được gọi lại. Nếu run cũ chưa thoát, helper từ chối để không có hai process cùng ghi. Input, code, model, thinking và các thiết lập nội dung phải tiếp tục khớp run gốc. Tăng concurrency không thay đổi LIMIT hay nhãn đã có. Số request server thực sự chạy song song còn phụ thuộc scheduler/KV cache.
+
 Khi toàn bộ selected samples thành công, file classified_input.jsonl giữ nguyên toàn bộ object gốc, chỉ thêm data_status, theo đúng thứ tự input. LIMIT=all phân loại toàn bộ; nếu chỉ thử LIMIT=5 thì file hoàn chỉnh chỉ bao gồm 5 samples được chọn, không phải toàn dataset. Dùng RUN_ID mới nếu đổi LIMIT.
 
 Ví dụ nguồn 2.010 dòng có một record issues rỗng tại dòng 578: counts.input=2010, input_valid=2009, input_invalid=1; với LIMIT=all có selected=2009. Khi 2.009 records này phân loại thành công, output có 2.009 records, classified_output_complete=true nhưng source_fully_classified=false. classification_details giữ input_index/input_line của nguồn gốc (có khoảng trống ở dòng lỗi); Application sau đó đánh số theo file classified_input.jsonl mới. Dùng doc_name để đối chiếu giữa hai giai đoạn.

@@ -39,6 +39,16 @@ INPUT_JSONL="$PROJECT_ROOT/input/judgment_with_issues_sample.jsonl" \
   JUDGE_THINKING_MODE=deepseek_vllm_xhigh bash scripts/statistic.sh
 ```
 
+Muốn ngắt để tăng batch/concurrency mà vẫn giữ kết quả statistic cũ: Ctrl-C và đợi process thoát, giữ RUN_ID đang chạy, rồi dùng helper. Ví dụ:
+
+```bash
+# Thay TEN_RUN_DANG_CHAY bằng RUN_ID thật đã có trong outputs.
+bash scripts/resume_statistic.sh TEN_RUN_DANG_CHAY \
+  --batch-size 200 --judge-concurrency 200
+```
+
+Helper khôi phục input, LIMIT, Judge, thinking, output budget và các thiết lập còn lại từ config.json; chỉ cập nhật hai giá trị lịch xử lý đã chỉ định, backup cấu hình cũ thành config.before-resume-*.json và ghi resume_config_changes.jsonl. Không sửa input/results, không gọi lại records thành công. Nó từ chối khi process cũ còn giữ lock hoặc input/code khác run gốc. Chỉ cần đồng bộ scripts/resume_statistic.sh và scripts/resume_statistic.py sang runtime; hai helper nằm ngoài package nên không làm đổi implementation hash của pipeline đang dùng. Cơ chế này dành riêng cho statistic; resume thông thường vẫn kiểm tra snapshot nghiêm ngặt.
+
 Application bây giờ **bắt buộc data_status=full/partial trên mọi record**, kể cả với DATA_STATUS_USED=all và ngoài LIMIT. Thiếu/sai nhãn làm validation thất bại rõ ràng, không đoán hoặc tự xóa record vì lỗi nhãn. Dùng classified_input.jsonl hoàn chỉnh từ statistic:
 
 ```bash
