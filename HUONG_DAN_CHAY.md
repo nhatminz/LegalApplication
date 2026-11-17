@@ -203,7 +203,7 @@ Hành vi của bước này:
 - Quét toàn bộ input, kể cả khi một lần chạy có LIMIT nhỏ.
 - Ghi dòng không parse được JSON/UTF-8 vào `removed_input_lines.jsonl`, rồi **xóa dòng đó khỏi chính INPUT_JSONL** và tiếp tục với dòng sau.
 - Giữ nguyên nội dung/thứ tự các dòng còn lại; LIMIT tính trên samples hợp lệ sau cleanup.
-- Nếu JSON parse được nhưng thiếu trường bắt buộc, sai schema, trùng doc_name hoặc thiếu nội dung luật, giữ nguyên record và báo lỗi để bạn sửa.
+- Nếu JSON parse được nhưng thiếu trường bắt buộc, issues rỗng/sai kiểu hoặc thiếu nội dung luật, lưu nguyên record vào removal log rồi xóa khỏi input và tiếp tục. Với doc_name trùng, giữ record hợp lệ đầu tiên, log và loại các bản sau. Không tự sinh issues/facts/luật để bù dữ liệu thiếu.
 - Không gọi generator hoặc Judge.
 
 Tệp mẫu trong workspace đã được làm sạch từ 7 dòng xuống 6 records hợp lệ. Nếu bản sao trên B200 vẫn còn dòng 7 bị cắt, bước này sẽ tự log và xóa dòng lỗi đó. Với file có 6 records thì chỉ chạy được tối đa 6 samples; cần input có ít nhất 20 records hợp lệ để có batch đủ 20 samples.
@@ -281,6 +281,12 @@ Nếu muốn **tổng cộng 20 samples**, dùng LIMIT=20 trong một run mới.
 Giới hạn concurrency là số request client có thể gửi đồng thời; số sequences server thực sự chạy tại một thời điểm còn phụ thuộc scheduler và KV cache.
 
 ## 8. Theo dõi tiến trình và đọc artifacts
+
+Khi chạy trực tiếp trong terminal, tqdm tự hiện thanh **Scan input**, **Validate input**, **Generation** và **Judge**. Hai thanh đầu theo bytes; hai thanh sau theo samples của toàn run, hiển thị batch, thời gian, tốc độ và ETA. Mỗi sample được cập nhật ngay khi xử lý xong, kể cả khi các requests trả về khác thứ tự.
+
+Các số phía sau thanh: `ok` = kết quả đã lưu hợp lệ, `failed` = lỗi trong invocation hiện tại, `skipped` = kết quả đã có đầu invocation, `review` = evaluation cần xem xét, `blocked` = không gọi Judge vì thiếu generation. Thanh đạt 100% là đã xử lý hết samples; đọc các số và summary để biết thành công/thất bại. Khi resume, số kết quả đã lưu được đưa vào initial progress, không gọi lại hoặc cộng trùng. Judge-only hiển thị Import generations và Judge.
+
+Progress được ghi ra stderr; console logging dùng tqdm.write để không ghi đè thanh. run.log vẫn là log văn bản chi tiết, không chứa mã điều khiển của thanh. Khi redirect stderr ra file hoặc môi trường không có TTY, thanh tự ẩn; theo dõi run.log bằng lệnh dưới.
 
 Trong terminal mới, chỉ cần khai báo root, output và tên run đang theo dõi. `FULL_RUN_ID` bên dưới phải là **tên chính xác đã in/sử dụng ở bước 7**, không tạo timestamp mới.
 
@@ -432,7 +438,8 @@ Nếu đang ở terminal mới, cần chạy lại phần exports ở bước 3,
 | Tình huống | Pipeline xử lý |
 |---|---|
 | JSON input hỏng, như chuỗi chưa đóng | Log đầy đủ rồi xóa dòng khỏi INPUT_JSONL, tiếp tục đọc samples sau |
-| JSON parse được nhưng thiếu facts_clean/issues/luật hoặc doc_name trùng | Giữ record, báo lỗi schema và dừng preflight |
+| JSON parse được nhưng thiếu facts_clean/issues/luật, issues rỗng/sai kiểu | Log với validation_stage=schema, xóa record khỏi input và tiếp tục các samples hợp lệ |
+| doc_name trùng | Giữ record hợp lệ đầu tiên, log và loại các bản sau với validation_stage=duplicate_doc_name |
 | Toàn input không còn record sau cleanup | Giữ removal log và báo lỗi input rỗng |
 | Timeout/connection lỗi, HTTP 408/409/429/5xx | Retry theo API_MAX_RETRIES và backoff; hết lượt thì ghi failed sample, tiếp tục các sample khác |
 | Generator không giải quyết đủ issues nhưng có final text hợp lệ | Lưu nguyên bài làm để Judge chấm coverage/correctness; không tự sinh lại để sửa bài |

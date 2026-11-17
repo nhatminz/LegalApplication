@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 
+from tqdm.contrib.logging import logging_redirect_tqdm
+
 from .config import Config
 from .pipeline import Pipeline
 
@@ -15,7 +17,8 @@ def main() -> int:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     try:
         config = Config.from_env()
-        summary = asyncio.run(Pipeline(config).run())
+        with logging_redirect_tqdm():
+            summary = asyncio.run(Pipeline(config).run())
         print(json.dumps({"run_dir": str(config.run_dir), "status": summary["status"], "counts": summary["counts"], "mean_score": summary["mean_score"]}, ensure_ascii=False))
         return 1 if summary["counts"]["failed"] else 0
     except (ValueError, OSError) as exc:

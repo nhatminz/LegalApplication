@@ -1,4 +1,4 @@
-"""Remove malformed input JSONL lines, preserving a durable recovery journal."""
+"""Remove unusable input JSONL records, preserving a durable recovery journal."""
 from __future__ import annotations
 
 import base64
@@ -9,11 +9,14 @@ import logging
 import os
 import stat
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
-from .data import strict_json
+from tqdm import tqdm
+
+from .data import parse_sample, strict_json
 from .storage import atomic_json, file_hash, now
 
 log = logging.getLogger(__name__)
@@ -48,8 +51,8 @@ def _commit_journal(path: Path, additions: Path) -> None:
 def clean_input(path: Path, run_dir: Path, record_config: Callable[[str], None]) -> dict:
     """Check all lines, commit configuration for the cleaned hash, then remove errors.
 
-    Only UTF-8/strict JSON errors are removed. Valid JSON with the wrong application
-    schema is left intact for read_dataset to reject. The callback verifies resume
+    UTF-8/JSON errors, invalid application records and duplicate doc_names are
+    removed. No missing facts, issues or laws are invented. The callback verifies resume
     BEFORE changing the input or its removal journal. Samples are indexed afterwards.
     """
     path = path.resolve()
@@ -65,25 +68,39 @@ def clean_input(path: Path, run_dir: Path, record_config: Callable[[str], None])
         try:
             before_digest, after_digest = hashlib.sha256(), hashlib.sha256()
             count = kept_count = removed_count = 0
+            removal_counts = Counter()
+            seen_docs = {}
             cleanup_id, timestamp = uuid4().hex, now()
             with path.open("rb") as source, tempfile.NamedTemporaryFile(
                 mode="wb", prefix="." + path.name + ".clean-", dir=path.parent, delete=False
             ) as kept, tempfile.NamedTemporaryFile(
                 mode="wb", prefix=".removed-input-", dir=run_dir, delete=False
-            ) as rejected:
+            ) as rejected, tqdm(total=os.fstat(source.fileno()).st_size, desc="Scan input", unit="B",
+                                unit_scale=True, dynamic_ncols=True, disable=None) as progress:
                 kept_path, rejected_path = Path(kept.name), Path(rejected.name)
                 os.fchmod(kept.fileno(), stat.S_IMODE(os.fstat(source.fileno()).st_mode))
                 for index, line in enumerate(source):
                     count += 1
                     before_digest.update(line)
                     decoded = None
+                    raw = None
+                    validation_stage = "json"
                     try:
                         decoded = line.decode("utf-8")
-                        strict_json(decoded)
+                        raw = strict_json(decoded)
+                        validation_stage = "schema"
+                        sample = parse_sample(raw, kept_count)
+                        if sample.doc_name in seen_docs:
+                            validation_stage = "duplicate_doc_name"
+                            raise ValueError(f"duplicate doc_name {sample.doc_name!r}; first valid occurrence at original line {seen_docs[sample.doc_name]}")
+                        seen_docs[sample.doc_name] = index + 1
                     except (ValueError, UnicodeError) as exc:
                         removed_count += 1
+                        removal_counts[validation_stage] += 1
                         entry = {"cleanup_id": cleanup_id, "timestamp": timestamp, "input_path": str(path),
                                  "original_input_index": index, "original_input_line": index + 1,
+                                 "validation_stage": validation_stage,
+                                 "doc_name": raw.get("doc_name") if isinstance(raw, dict) and isinstance(raw.get("doc_name"), str) else None,
                                  "error_type": type(exc).__name__, "error": str(exc),
                                  "json_error_line": getattr(exc, "lineno", None),
                                  "json_error_column": getattr(exc, "colno", None),
@@ -94,6 +111,8 @@ def clean_input(path: Path, run_dir: Path, record_config: Callable[[str], None])
                         kept_count += 1
                         kept.write(line)
                         after_digest.update(line)
+                    progress.set_postfix(kept=kept_count, invalid=removed_count, refresh=False)
+                    progress.update(len(line))
                 for output in [kept, rejected]:
                     output.flush()
                     os.fsync(output.fileno())
@@ -119,8 +138,13 @@ def clean_input(path: Path, run_dir: Path, record_config: Callable[[str], None])
                 raise ValueError("Input does not match the pending cleanup transaction")
 
             def save_report():
+                reasons = Counter()
+                for transaction in transactions:
+                    if transaction["status"] == "applied":
+                        reasons.update(transaction.get("removal_counts", {"json": transaction["removed_count"]}))
                 report.update(input_sha256_after=after, cleaned_line_count=kept_count,
                               removed_count=sum(t["removed_count"] for t in transactions if t["status"] == "applied"),
+                              removal_counts=dict(reasons),
                               updated_at=now())
                 report["original_line_count"] = kept_count + report["removed_count"]
                 atomic_json(report_path, report)
@@ -136,7 +160,7 @@ def clean_input(path: Path, run_dir: Path, record_config: Callable[[str], None])
                     transaction = {"cleanup_id": cleanup_id, "status": "prepared", "timestamp": timestamp,
                                    "input_sha256_before": before, "input_sha256_after": after,
                                    "original_line_count": count, "cleaned_line_count": kept_count,
-                                   "removed_count": removed_count}
+                                   "removed_count": removed_count, "removal_counts": dict(removal_counts)}
                     transactions.append(transaction)
                     save_report()
                 if file_hash(path) != before:
@@ -144,7 +168,12 @@ def clean_input(path: Path, run_dir: Path, record_config: Callable[[str], None])
                 os.replace(kept_path, path)
                 _fsync_directory(path.parent)
                 transaction["status"] = "applied"
-                log.warning("Removed malformed input JSON lines count=%d input=%s journal=%s", removed_count, path, journal_path)
+                log.warning("Removed invalid input records count=%d reasons=%s input=%s journal=%s", removed_count, dict(removal_counts), path, journal_path)
+                with rejected_path.open(encoding="utf-8") as rejected:
+                    for rejected_line in rejected:
+                        entry = strict_json(rejected_line)
+                        log.warning("Input record removed original_line=%d doc_name=%s stage=%s error=%s",
+                                    entry["original_input_line"], entry["doc_name"], entry["validation_stage"], entry["error"])
             else:
                 journal_path.touch(exist_ok=True)
             save_report()

@@ -6,6 +6,8 @@ from collections import Counter
 from statistics import mean
 from uuid import uuid4
 
+from tqdm import tqdm
+
 from .api import APIClient, APIError, IncompleteResponse
 from .config import Config
 from .data import DatasetError, Sample, canonical_hash, read_dataset, strict_json
@@ -52,13 +54,15 @@ def index_records(records: list[dict], samples: dict[str, Sample], *, allow_unse
     return indexed
 
 
-async def bounded_map(items: list, concurrency: int, process) -> None:
+async def bounded_map(items: list, concurrency: int, process, on_done=None) -> None:
     """At most concurrency live tasks, regardless of batch size."""
     iterator = iter(items)
 
     async def worker():
         for item in iterator:
             await process(item)
+            if on_done is not None:
+                on_done(item)
 
     tasks = [asyncio.create_task(worker()) for _ in range(min(concurrency, len(items)))]
     try:
@@ -325,14 +329,46 @@ class Pipeline:
                 log.info("Evaluation saved doc_name=%s input_index=%d status=%s score=%s", sample.doc_name, sample.input_index, record["evaluation_status"], record["score_components"]["total"])
 
             store.summary(self.summary(dataset, "running"))
-            for start in range(0, len(dataset.samples), config.batch_size):
-                batch = dataset.samples[start:start + config.batch_size]
-                log.info("Batch start number=%d size=%d input_indices=%s", start // config.batch_size + 1, len(batch), [s.input_index for s in batch])
-                await bounded_map(batch, config.generator_concurrency, generate)
-                await bounded_map(batch, config.judge_concurrency, evaluate)
-                interim = self.summary(dataset, "running")
-                store.summary(interim)
-                log.info("Batch done selected=%d completed=%d failed=%d review=%d", len(samples), interim["counts"]["completed"], interim["counts"]["failed"], interim["counts"]["needs_review"])
+            saved_generations, saved_evaluations = set(self.generations), set(self.evaluations)
+            blocked = 0
+            review_count = sum(row["needs_review"] for row in self.evaluations.values())
+            with tqdm(total=len(samples), initial=len(saved_generations), unit="sample", position=0,
+                      desc="Generation" if config.mode == "full" else "Import generations",
+                      miniters=1, dynamic_ncols=True, disable=None) as gen_progress, \
+                 tqdm(total=len(samples), initial=len(saved_evaluations), unit="sample", position=1,
+                      desc="Judge", miniters=1, dynamic_ncols=True, disable=None) as judge_progress:
+
+                def generation_finished(sample):
+                    gen_progress.set_postfix(ok=len(self.generations), failed=self.counters["generation"]["failed"],
+                                             skipped=len(saved_generations), refresh=False)
+                    if sample.doc_name not in saved_generations:
+                        gen_progress.update(1)
+
+                def evaluation_finished(sample):
+                    nonlocal blocked, review_count
+                    if sample.doc_name not in saved_evaluations:
+                        if sample.doc_name not in self.generations:
+                            blocked += 1
+                        elif sample.doc_name in self.evaluations:
+                            review_count += int(self.evaluations[sample.doc_name]["needs_review"])
+                    judge_progress.set_postfix(ok=len(self.evaluations), failed=self.counters["evaluation"]["failed"],
+                                               skipped=len(saved_evaluations), blocked=blocked, review=review_count, refresh=False)
+                    if sample.doc_name not in saved_evaluations:
+                        judge_progress.update(1)
+
+                gen_progress.set_postfix(ok=len(saved_generations), failed=0, skipped=len(saved_generations), refresh=False)
+                judge_progress.set_postfix(ok=len(saved_evaluations), failed=0, skipped=len(saved_evaluations),
+                                           blocked=0, review=review_count, refresh=False)
+                for start in range(0, len(dataset.samples), config.batch_size):
+                    batch = dataset.samples[start:start + config.batch_size]
+                    gen_progress.set_description(f"{'Generation' if config.mode == 'full' else 'Import generations'} [batch {start // config.batch_size + 1}]")
+                    judge_progress.set_description(f"Judge [batch {start // config.batch_size + 1}]")
+                    log.info("Batch start number=%d size=%d input_indices=%s", start // config.batch_size + 1, len(batch), [s.input_index for s in batch])
+                    await bounded_map(batch, config.generator_concurrency, generate, generation_finished)
+                    await bounded_map(batch, config.judge_concurrency, evaluate, evaluation_finished)
+                    interim = self.summary(dataset, "running")
+                    store.summary(interim)
+                    log.info("Batch done selected=%d completed=%d failed=%d review=%d", len(samples), interim["counts"]["completed"], interim["counts"]["failed"], interim["counts"]["needs_review"])
             summary = self.summary(dataset, "completed")
             if summary["counts"]["failed"]:
                 summary["status"] = "completed_with_errors"

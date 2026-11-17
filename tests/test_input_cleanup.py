@@ -75,16 +75,96 @@ def test_invalid_encoding_blank_and_strict_json_logged_exactly(tmp_path, bad):
     assert entry["byte_length"] == len(bad)
 
 
-def test_valid_json_with_wrong_schema_not_deleted(config_factory, mock_transports):
+def test_valid_json_with_wrong_schema_removed_and_run_continues(config_factory, mock_transports):
     config = config_factory()
     bad_schema = json.dumps({"doc_name": "missing-fields"}) + "\n"
     with config.input_jsonl.open("a") as output:
         output.write(bad_schema)
-    before = config.input_jsonl.read_bytes()
+    summary = invoke(config, mock_transports)
+    assert summary["counts"]["completed"] == 1
+    assert summary["counts"]["input_removed"] == 1
+    entries = read_jsonl(config.run_dir / "removed_input_lines.jsonl")
+    assert entries[0]["validation_stage"] == "schema"
+    assert entries[0]["doc_name"] == "missing-fields"
+    assert entries[0]["raw_line"] == bad_schema
+    assert len(read_dataset(config.input_jsonl, None).samples) == 1
+
+
+@pytest.mark.parametrize("issues", [[], None, "", {}, [" "]])
+def test_invalid_issues_between_valid_records_are_logged_deleted_and_not_generated(config_factory, mock_transports, issues):
+    bad = make_record("invalid-issues")
+    bad["issues"] = issues
+    config = config_factory([make_record("before"), bad, make_record("after")], limit=2)
+    summary = invoke(config, mock_transports)
+    assert summary["counts"]["input"] == 3
+    assert summary["counts"]["input_removed"] == 1
+    assert summary["counts"]["completed"] == summary["counts"]["selected"] == 2
+    generations = read_jsonl(config.run_dir / "generations.jsonl")
+    assert [(row["doc_name"], row["input_index"]) for row in generations] == [("before", 0), ("after", 1)]
+    entry = read_jsonl(config.run_dir / "removed_input_lines.jsonl")[0]
+    assert entry["original_input_line"] == 2 and entry["doc_name"] == "invalid-issues"
+    assert entry["validation_stage"] == "schema" and "issues" in entry["error"]
+    assert json.loads(entry["raw_line"])["issues"] == issues
+    assert summary["input_cleanup"]["removal_counts"] == {"schema": 1}
+    resumed = invoke(replace(config, resume=True), mock_transports)
+    assert resumed["counts"]["skipped"] == 2
+    assert len(mock_transports[2]["generator"]) == 2
+
+
+def test_reported_line_578_empty_issues_reproduction(config_factory, mock_transports):
+    rows = [make_record(f"case-{i}") for i in range(579)]
+    rows[577]["issues"] = []
+    config = config_factory(rows, mode="validate-only")
+    summary = invoke(config, mock_transports)
+    assert summary["status"] == "validated"
+    assert summary["counts"]["input"] == 579
+    assert summary["counts"]["input_valid"] == summary["counts"]["selected"] == 578
+    entry = read_jsonl(config.run_dir / "removed_input_lines.jsonl")[0]
+    assert entry["original_input_line"] == 578
+    assert entry["error"] == "issues must be a nonempty list"
+    cleaned = read_dataset(config.input_jsonl, None)
+    assert cleaned.samples[-1].doc_name == "case-578"
+    assert cleaned.samples[-1].input_index == 577
+    assert not mock_transports[2]["generator"] and not mock_transports[2]["judge"]
+
+
+def test_duplicate_doc_names_keep_first_valid_record_and_log_later_one(config_factory, mock_transports):
+    first = make_record("repeated")
+    invalid_first = make_record("repeated")
+    invalid_first["issues"] = []
+    duplicate = make_record("repeated")
+    duplicate["benchmark_seed"]["facts_clean"] = "A different later duplicate record"
+    config = config_factory([invalid_first, first, duplicate, make_record("after")])
+    summary = invoke(config, mock_transports)
+    assert summary["counts"]["completed"] == 2
+    entries = read_jsonl(config.run_dir / "removed_input_lines.jsonl")
+    assert [e["validation_stage"] for e in entries] == ["schema", "duplicate_doc_name"]
+    assert "original line 2" in entries[1]["error"]
+    assert [s.doc_name for s in read_dataset(config.input_jsonl, None).samples] == ["repeated", "after"]
+
+
+def test_resume_removes_new_schema_errors_without_regenerating(config_factory, mock_transports):
+    config = config_factory([make_record("kept")])
+    invoke(config, mock_transports)
+    clean_bytes = config.input_jsonl.read_bytes()
+    bad = make_record("bad")
+    bad["issues"] = []
+    config.input_jsonl.write_bytes((json.dumps(bad) + "\n").encode() + clean_bytes)
+    summary = invoke(replace(config, resume=True), mock_transports)
+    assert config.input_jsonl.read_bytes() == clean_bytes
+    assert summary["counts"]["skipped"] == summary["counts"]["input_removed"] == 1
+    assert len(mock_transports[2]["generator"]) == 1
+
+
+def test_only_invalid_schema_records_produce_empty_input_report(config_factory, mock_transports):
+    bad = make_record()
+    bad["issues"] = []
+    config = config_factory([bad])
     with pytest.raises(DatasetError):
         invoke(config, mock_transports)
-    assert config.input_jsonl.read_bytes() == before
-    assert not read_jsonl(config.run_dir / "removed_input_lines.jsonl")
+    assert config.input_jsonl.read_bytes() == b""
+    entry = read_jsonl(config.run_dir / "removed_input_lines.jsonl")[0]
+    assert entry["validation_stage"] == "schema"
     assert not mock_transports[2]["generator"] and not mock_transports[2]["judge"]
 
 

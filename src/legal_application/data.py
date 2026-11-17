@@ -5,6 +5,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from tqdm import tqdm
+
 
 def canonical_hash(value: object) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False).encode()).hexdigest()
@@ -121,7 +123,8 @@ def read_dataset(path: Path, limit: int | None) -> Dataset:
     selected, errors, seen = [], [], set()
     count = valid = 0
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with path.open("rb") as handle, tqdm(total=path.stat().st_size, desc="Validate input", unit="B",
+                                         unit_scale=True, dynamic_ncols=True, disable=None) as progress:
         for index, line in enumerate(handle):
             count += 1
             digest.update(line)
@@ -135,6 +138,8 @@ def read_dataset(path: Path, limit: int | None) -> Dataset:
                     selected.append(sample)
             except (ValueError, UnicodeError) as exc:
                 errors.append({"input_index": index, "input_line": index + 1, "error": str(exc)})
+            progress.set_postfix(valid=valid, errors=len(errors), refresh=False)
+            progress.update(len(line))
     if not count:
         errors.append({"input_line": None, "error": "Input JSONL is empty"})
     if errors:
