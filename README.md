@@ -100,13 +100,49 @@ vllm serve "$MODEL_PATH" \
 
 Cấu hình tensor parallel, context length, tokenizer và reasoning parser phải phù hợp checkpoint/hạ tầng. Endpoint cần đủ context cho **toàn bộ** văn bản và output budget; khi bị từ chối do context quá dài, pipeline ghi lỗi sample, không cắt dữ liệu và không giảm budget ngầm.
 
-Judge mặc định cố định là `DeepSeek-V4.1-Flash-1017` tại `http://172.29.62.173:8000/v1`, effort xhigh. Cách gửi được đối chiếu trực tiếp với `LegalDataset/src/legal_issue_pipeline/llm/adapters.py`, `DeepSeekVLLMAdapter` và `tests/unit/test_vllm_effort.py` trong repository lân cận:
+Judge mặc định là `DeepSeek-V4.1-Flash-1017` tại `http://172.29.62.173:8000/v1`, với `JUDGE_THINKING_MODE=deepseek_vllm_xhigh`. Cách gửi được đối chiếu trực tiếp với `LegalDataset/src/legal_issue_pipeline/llm/adapters.py`, `DeepSeekVLLMAdapter` và `tests/unit/test_vllm_effort.py` trong repository lân cận:
 
 ```json
 {"chat_template_kwargs":{"thinking":true,"reasoning_effort":75}}
 ```
 
 Không gửi `reasoning_effort="xhigh"` ở top level và không dùng cách map của hosted DeepSeek API. Budget 75 là tham số effort, độc lập với `max_tokens`. Mặc định generator không gửi tham số reasoning riêng và dùng thiết lập của server/template. Nếu generator cũng là DeepSeek vLLM tương ứng, đặt `GENERATOR_THINKING_MODE=deepseek_vllm_xhigh` để gửi đúng body trên.
+
+Hai vai trò có thinking mode riêng, có thể export hoặc sửa mặc định trong script:
+
+```bash
+export GENERATOR_THINKING_MODE=none
+export JUDGE_THINKING_MODE=deepseek_vllm_xhigh
+```
+
+Các lựa chọn dưới đây dùng được độc lập cho cả GENERATOR_THINKING_MODE và JUDGE_THINKING_MODE:
+
+| Giá trị | Body gửi tới endpoint |
+|---|---|
+| `low` | DeepSeek vLLM: thinking=true, reasoning_effort=25 |
+| `high` | DeepSeek vLLM: thinking=true, reasoning_effort=50 |
+| `xhigh` | DeepSeek vLLM: thinking=true, reasoning_effort=75 |
+| `max` | DeepSeek vLLM: thinking=true, reasoning_effort=100 |
+| Số nguyên `1`–`100`, ví dụ `63` | DeepSeek vLLM: thinking=true, reasoning_effort là số nguyên tương ứng |
+| `on` / `off` | DeepSeek vLLM: thinking=true / false, không gửi effort |
+| `default` | Không gửi tham số thinking/effort, dùng server/template |
+| `none` | Alias cũ của default, giữ tương thích; KHÔNG có nghĩa tắt thinking |
+| `qwen3_on` / `qwen3_off` | Qwen3: enable_thinking=true / false, không gửi effort DeepSeek |
+| `deepseek_vllm_<giá trị>` | Alias rõ backend, ví dụ deepseek_vllm_high, deepseek_vllm_max, deepseek_vllm_63, deepseek_vllm_off |
+
+Các tham số template trong bảng được gửi bên trong `chat_template_kwargs`. Muốn tắt DeepSeek, dùng `off`; muốn tắt Qwen3, dùng `qwen3_off`. `medium` và `minimal` không được hỗ trợ bởi DeepSeek V4.1 vLLM; pipeline từ chối rõ thay vì tự map. Theo [recipe chính thức](https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash#reasoning-and-tool-calling), backend này có bốn tier 25/50/75/100 và budget nguyên 1–100. [DeepSeek hosted API](https://api-docs.deepseek.com/api/create-chat-completion/) có interface và tier mapping khác; các mức ở đây dành cho endpoint vLLM, không phải adapter API hosted. Budget effort không phải số output tokens; MAX_OUTPUT_TOKENS vẫn độc lập.
+
+Ví dụ chọn hai mức khác nhau hoặc chọn budget cụ thể:
+
+```bash
+export GENERATOR_THINKING_MODE=high
+export JUDGE_THINKING_MODE=max
+
+# Hoặc đặt Judge ở budget 63:
+export JUDGE_THINKING_MODE=63
+```
+
+Mode yêu cầu, backend, trạng thái bật/tắt, budget và tham số thực tế của cả hai vai trò được ghi trong config.json và run.log; metadata từng request ghi actual_thinking_parameters. Đổi mode cần RUN_ID mới. Mặc định cũ vẫn giữ: generator dùng none, Judge dùng deepseek_vllm_xhigh.
 
 Judge mặc định dùng `response_format.type=json_schema`, `strict=true`. Nếu endpoint chỉ hỗ trợ JSON object, có thể **cấu hình rõ trước run mới** `JUDGE_RESPONSE_FORMAT=json_object`; pipeline vẫn validate cùng schema ở phía Python. Không tự fallback sau HTTP 400, không tắt xhigh ngầm. `message.reasoning_content` không được đọc, lưu hoặc chuyển vai trò; raw response trong artifacts là nguyên văn `message.content`, không strip whitespace. Endpoint reasoning cần tách final content đúng cách.
 
@@ -219,7 +255,7 @@ Mọi biến dưới đây có thể export hoặc sửa mặc định ở đầ
 | `INPUT_JSONL` | `$PROJECT_ROOT/input/judgment_with_issues_sample.jsonl` |
 | `GENERATOR_BASE_URL`, `GENERATOR_MODEL` | Script điền sẵn `http://127.0.0.1:8001/v1`, `Qwen/Qwen3-4B`; sửa ở đầu script hoặc export để đổi model/server. Python CLI trực tiếp vẫn yêu cầu cấu hình rõ |
 | `JUDGE_BASE_URL` | `http://172.29.62.173:8000/v1` |
-| `JUDGE_MODEL` | `DeepSeek-V4.1-Flash-1017`; effort xhigh luôn giữ cố định |
+| `JUDGE_MODEL` | `DeepSeek-V4.1-Flash-1017` |
 | `LIMIT` | Rỗng/all/none = toàn bộ; 0 = không chọn sample; số dương = giới hạn chính xác |
 | `BATCH_SIZE` | 20 |
 | `GENERATOR_CONCURRENCY`, `JUDGE_CONCURRENCY` | 20, 20 |
@@ -233,7 +269,8 @@ Mọi biến dưới đây có thể export hoặc sửa mặc định ở đầ
 | `API_MAX_RETRIES` | 3 retries ngoài lần HTTP đầu |
 | `JUDGE_JSON_RETRIES` | 2 lần sửa structured response ngoài lần đầu |
 | `RETRY_BACKOFF_SECONDS` | 2; tests đặt 0 |
-| `GENERATOR_THINKING_MODE` | none / deepseek_vllm_xhigh |
+| `GENERATOR_THINKING_MODE` | Mặc định none; hỗ trợ default/none, low/high/xhigh/max, số nguyên 1–100, on/off, alias deepseek_vllm_*, qwen3_on/off |
+| `JUDGE_THINKING_MODE` | Mặc định deepseek_vllm_xhigh; cùng toàn bộ lựa chọn với generator |
 | `JUDGE_RESPONSE_FORMAT` | json_schema / json_object, không tự fallback |
 | `GENERATOR_API_KEY`, `JUDGE_API_KEY` | EMPTY nếu endpoint không yêu cầu key |
 

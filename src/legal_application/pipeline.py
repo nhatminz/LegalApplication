@@ -13,6 +13,7 @@ from .input_cleanup import clean_input
 from .prompts import generator_messages, judge_messages
 from .scoring import LABEL_SCHEMA, LabelError, score_labels
 from .storage import RunStore, file_hash, implementation_hash, now, read_jsonl
+from .thinking import resolve_thinking
 
 log = logging.getLogger(__name__)
 
@@ -189,13 +190,21 @@ class Pipeline:
 
     async def _run(self, store: RunStore) -> dict:
         config = self.config
+        generator_thinking = resolve_thinking(config.generator_thinking_mode)
+        judge_thinking = resolve_thinking(config.judge_thinking_mode)
         snapshot = {**config.snapshot(), "artifact_version": 1, "implementation_sha256": implementation_hash(),
                     "generation_source_sha256": file_hash(config.generation_jsonl) if config.generation_jsonl else None,
-                    "judge_reasoning_effort": "xhigh", "judge_reasoning_parameters": {"thinking": True, "reasoning_effort": 75}}
+                    "generator_thinking": generator_thinking, "judge_thinking": judge_thinking,
+                    "judge_reasoning_effort": judge_thinking["effort"],
+                    "judge_reasoning_parameters": judge_thinking["parameters"].get("chat_template_kwargs", {})}
         log.info("Run start run_id=%s mode=%s limit=%s batch_size=%d invocation=%s", config.run_id, config.mode, config.limit, config.batch_size, self.invocation_id)
         self.input_cleanup = clean_input(config.input_jsonl, store.path,
                                         lambda digest: store.configure({**snapshot, "input_sha256": digest}))
         snapshot["input_sha256"] = self.input_cleanup["input_sha256_after"]
+        for role, settings in [("generator", generator_thinking), ("judge", judge_thinking)]:
+            log.info("Thinking role=%s mode=%s backend=%s enabled=%s budget=%s parameters=%s", role,
+                     settings["requested_mode"], settings["backend"], settings["thinking_enabled"],
+                     settings["effort_budget"], settings["parameters"])
         try:
             dataset = read_dataset(config.input_jsonl, config.limit)
         except DatasetError as exc:

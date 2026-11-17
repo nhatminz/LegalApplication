@@ -11,8 +11,10 @@ set -euo pipefail
 export GENERATOR_BASE_URL="${GENERATOR_BASE_URL:-http://127.0.0.1:8001/v1}"
 export GENERATOR_MODEL="${GENERATOR_MODEL:-Qwen/Qwen3-4B}"
 export GENERATOR_API_KEY="${GENERATOR_API_KEY:-EMPTY}"
-# none = không gửi tham số reasoning riêng; Qwen dùng mặc định của server/template.
-# Chỉ chọn deepseek_vllm_xhigh khi generator là DeepSeek vLLM tương ứng.
+# DeepSeek V4.1 vLLM: low=25, high=50, xhigh=75, max=100 hoặc số nguyên 1–100.
+# on/off = bật/tắt DeepSeek; default/none = dùng mặc định server (none là alias cũ).
+# Qwen3: qwen3_on/qwen3_off. Không dùng các mức effort DeepSeek cho Qwen3.
+# Các tên cũ như deepseek_vllm_xhigh vẫn được hỗ trợ.
 export GENERATOR_THINKING_MODE="${GENERATOR_THINKING_MODE:-none}"
 
 # Runtime paths are based on PROJECT_ROOT. Relative path exports also resolve from it.
@@ -25,10 +27,12 @@ export MODE="${MODE:-full}"  # full | judge-only | validate-only
 export GENERATION_JSONL="${GENERATION_JSONL:-}"
 export RESUME="${RESUME:-0}"
 
-# MODEL JUDGE: chấm bài làm của generator bằng DeepSeek với effort xhigh.
+# MODEL JUDGE: chấm bài làm của generator, mặc định DeepSeek với effort xhigh.
 export JUDGE_BASE_URL="${JUDGE_BASE_URL:-http://172.29.62.173:8000/v1}"
 export JUDGE_MODEL="${JUDGE_MODEL:-DeepSeek-V4.1-Flash-1017}"
 export JUDGE_API_KEY="${JUDGE_API_KEY:-EMPTY}"
+# Cùng các lựa chọn như GENERATOR_THINKING_MODE ở trên; mặc định Judge xhigh=75.
+export JUDGE_THINKING_MODE="${JUDGE_THINKING_MODE:-deepseek_vllm_xhigh}"
 export JUDGE_RESPONSE_FORMAT="${JUDGE_RESPONSE_FORMAT:-json_schema}"
 
 export LIMIT="${LIMIT:-}"  # Empty/all = ALL input; 0 = select zero; no hidden cap.

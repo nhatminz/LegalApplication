@@ -94,6 +94,7 @@ export GENERATOR_THINKING_MODE=none
 export JUDGE_BASE_URL=http://172.29.62.173:8000/v1
 export JUDGE_MODEL=DeepSeek-V4.1-Flash-1017
 export JUDGE_API_KEY=EMPTY
+export JUDGE_THINKING_MODE=deepseek_vllm_xhigh
 export JUDGE_RESPONSE_FORMAT=json_schema
 
 # Mỗi batch tối đa 20 samples, mỗi giai đoạn tối đa 20 requests đồng thời.
@@ -117,7 +118,42 @@ export GENERATION_JSONL=""
 export RUN_ID=""
 ```
 
-`GENERATOR_THINKING_MODE=none` có nghĩa client không gửi tham số reasoning riêng cho generator. Qwen3 dùng mặc định thinking của server/template. Judge luôn được gọi với xhigh, body `chat_template_kwargs={"thinking":true,"reasoning_effort":75}`; không dùng tham số xhigh của DeepSeek cho Qwen3.
+`GENERATOR_THINKING_MODE=none` có nghĩa client không gửi tham số reasoning riêng cho generator. Qwen3 dùng mặc định thinking của server/template. `JUDGE_THINKING_MODE=deepseek_vllm_xhigh` mặc định gửi `chat_template_kwargs={"thinking":true,"reasoning_effort":75}`. Cả hai biến hỗ trợ đầy đủ bảng lựa chọn sau; đổi thinking mode cần RUN_ID mới.
+
+| Giá trị | Ý nghĩa |
+|---|---|
+| `low`, `high`, `xhigh`, `max` | DeepSeek V4.1 vLLM: bật thinking với effort lần lượt 25, 50, 75, 100 |
+| Số nguyên `1`–`100` | DeepSeek V4.1 vLLM: bật thinking với effort cụ thể, ví dụ 63 |
+| `on`, `off` | DeepSeek: bật/tắt thinking; không gửi effort |
+| `default`, `none` | Không gửi tham số thinking; none giữ nghĩa cũ của pipeline, KHÔNG phải tắt |
+| `qwen3_on`, `qwen3_off` | Bật/tắt thinking cho Qwen3 bằng enable_thinking |
+| `deepseek_vllm_<mức>` | Alias tương đương: deepseek_vllm_low/high/xhigh/max/on/off hoặc deepseek_vllm_63 |
+
+Không dùng các mức effort DeepSeek cho Qwen3. `medium` và `minimal` không phải tier của DeepSeek V4.1 vLLM, nên bị báo lỗi thay vì tự đoán mapping. Đây là interface của model self-hosted, khác [DeepSeek hosted API](https://api-docs.deepseek.com/api/create-chat-completion/). Bảng 25/50/75/100 và range 1–100 được đối chiếu với [recipe vLLM](https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash#reasoning-and-tool-calling) và adapter LegalDataset. Effort không phải giới hạn token; MAX_OUTPUT_TOKENS vẫn giữ vai trò riêng.
+
+Ví dụ đổi Judge sang max, hoặc chọn budget cụ thể, trong một run mới:
+
+```bash
+export JUDGE_THINKING_MODE=max
+
+# Thay dòng trên bằng dòng này nếu muốn effort 63:
+# export JUDGE_THINKING_MODE=63
+
+# Nếu generator là Qwen3 và muốn tắt thinking của nó:
+# export GENERATOR_THINKING_MODE=qwen3_off
+```
+
+config.json/run.log ghi mode yêu cầu và tham số thực tế cho từng vai trò; request metadata ghi actual_thinking_parameters. Giữ xhigh nếu muốn dùng cấu hình Judge mặc định của benchmark.
+
+Nếu dùng cùng endpoint DeepSeek cho cả hai vai trò, export các giá trị sau trước khi tạo run mới:
+
+```bash
+export GENERATOR_BASE_URL="$JUDGE_BASE_URL"
+export GENERATOR_MODEL="$JUDGE_MODEL"
+export GENERATOR_API_KEY="$JUDGE_API_KEY"
+export GENERATOR_THINKING_MODE=deepseek_vllm_xhigh
+export JUDGE_THINKING_MODE=deepseek_vllm_xhigh
+```
 
 Nếu model host ở **máy khác**, chỉ đổi `GENERATOR_BASE_URL` thành IP/hostname thật của máy host, giữ `/v1` ở cuối. Ví dụ cú pháp:
 
@@ -342,7 +378,7 @@ fields = [
     "generator_base_url", "generator_model", "judge_base_url", "judge_model",
     "batch_size", "generator_concurrency", "judge_concurrency", "max_output_tokens",
     "timeout_seconds", "api_max_retries", "judge_json_retries", "retry_backoff",
-    "generator_thinking_mode", "judge_response_format",
+    "generator_thinking_mode", "judge_thinking_mode", "judge_response_format",
 ]
 aliases = {"timeout_seconds": "API_TIMEOUT_SECONDS", "retry_backoff": "RETRY_BACKOFF_SECONDS"}
 exports = []
@@ -413,7 +449,7 @@ Các request HTTP 400/401/404/422 không được tự retry bằng cách đổi
 export JUDGE_RESPONSE_FORMAT=json_object
 ```
 
-Client vẫn validate cùng schema và tính điểm bằng Python. Effort xhigh của Judge không đổi.
+Client vẫn validate cùng schema và tính điểm bằng Python. Thinking mode được giữ theo JUDGE_THINKING_MODE đã export.
 
 Nếu gặp lỗi context, input cộng output đã vượt giới hạn server. Pipeline ghi lỗi, không tự cắt luật/facts hoặc giảm MAX_OUTPUT_TOKENS. Giá trị 65536 cho MAX_OUTPUT_TOKENS chỉ dùng khi **cả hai endpoints** hỗ trợ budget/context tương ứng; thay giá trị đó cần run mới.
 
@@ -456,6 +492,7 @@ tmux attach -t legal-application
 | Chọn tổng số samples | LIMIT: 1, 5, 20, ...; all/rỗng = toàn bộ |
 | Số samples mỗi batch | BATCH_SIZE, hiện là 20 |
 | Số request đồng thời | GENERATOR_CONCURRENCY và JUDGE_CONCURRENCY, hiện đều là 20 |
+| Thinking theo vai trò | GENERATOR_THINKING_MODE và JUDGE_THINKING_MODE; hỗ trợ low/high/xhigh/max, 1–100, on/off, default/none, alias deepseek_vllm_*, qwen3_on/off |
 | Đổi nơi lưu kết quả | OUTPUT_DIR; mỗi RUN_ID là một thư mục riêng |
 | Tiếp tục run cũ | RUN_ID cũ + RESUME=1, giữ cấu hình snapshot |
 

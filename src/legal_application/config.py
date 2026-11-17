@@ -8,6 +8,8 @@ from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from .thinking import resolve_thinking
+
 
 def rooted(root: Path, value: str) -> Path:
     path = Path(value).expanduser()
@@ -43,6 +45,7 @@ class Config:
     retry_backoff: float = 2
     resume: bool = False
     generator_thinking_mode: str = "none"
+    judge_thinking_mode: str = "deepseek_vllm_xhigh"
     judge_response_format: str = "json_schema"
     generator_api_key: str = field(default="EMPTY", repr=False)
     judge_api_key: str = field(default="EMPTY", repr=False)
@@ -74,6 +77,7 @@ class Config:
             retry_backoff=float(e.get("RETRY_BACKOFF_SECONDS", "2")),
             resume=flag(e.get("RESUME", "0")),
             generator_thinking_mode=e.get("GENERATOR_THINKING_MODE", "none"),
+            judge_thinking_mode=e.get("JUDGE_THINKING_MODE", "deepseek_vllm_xhigh"),
             judge_response_format=e.get("JUDGE_RESPONSE_FORMAT", "json_schema"),
             generator_api_key=e.get("GENERATOR_API_KEY", "EMPTY"), judge_api_key=e.get("JUDGE_API_KEY", "EMPTY"),
         )
@@ -99,8 +103,11 @@ class Config:
                 raise ValueError(f"{name} cannot be negative")
         if self.limit is not None and self.limit < 0:
             raise ValueError("LIMIT must be nonnegative, or empty/all for the entire input")
-        if self.generator_thinking_mode not in {"none", "deepseek_vllm_xhigh"}:
-            raise ValueError("GENERATOR_THINKING_MODE must be none or deepseek_vllm_xhigh")
+        for role in ["generator", "judge"]:
+            try:
+                resolve_thinking(getattr(self, f"{role}_thinking_mode"))
+            except ValueError as exc:
+                raise ValueError(f"{role.upper()}_THINKING_MODE: {exc}") from None
         if self.judge_response_format not in {"json_schema", "json_object"}:
             raise ValueError("JUDGE_RESPONSE_FORMAT must be json_schema or json_object")
         for role in ["generator", "judge"]:

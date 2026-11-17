@@ -48,6 +48,34 @@ def test_free_text_generator_exact_raw_response_and_optional_thinking(config_fac
     call(client)
 
 
+@pytest.mark.parametrize("generator_mode", ["none", "deepseek_vllm_xhigh"])
+@pytest.mark.parametrize("judge_mode", ["none", "deepseek_vllm_xhigh"])
+def test_thinking_modes_are_independent_per_role(config_factory, generator_mode, judge_mode):
+    config = config_factory(generator_thinking_mode=generator_mode, judge_thinking_mode=judge_mode)
+    for role, mode in [("generator", generator_mode), ("judge", judge_mode)]:
+        def handle(request):
+            body = json.loads(request.content)
+            if mode == "none":
+                assert "chat_template_kwargs" not in body and "reasoning_effort" not in body
+            else:
+                assert body["chat_template_kwargs"] == {"thinking": True, "reasoning_effort": 75}
+            assert ("response_format" in body) == (role == "judge")
+            return httpx.Response(200, json=envelope("{}"))
+
+        completion = call(APIClient(config, role, httpx.MockTransport(handle)))
+        actual = completion.metadata["actual_thinking_parameters"]
+        assert actual == ({} if mode == "none" else {"chat_template_kwargs": {"thinking": True, "reasoning_effort": 75}})
+
+
+def test_judge_thinking_mode_env_and_validation(config_factory, monkeypatch):
+    monkeypatch.setenv("JUDGE_THINKING_MODE", "none")
+    assert Config.from_env().judge_thinking_mode == "none"
+    monkeypatch.delenv("JUDGE_THINKING_MODE")
+    assert Config.from_env().judge_thinking_mode == "deepseek_vllm_xhigh"
+    with pytest.raises(ValueError, match="JUDGE_THINKING_MODE"):
+        config_factory(judge_thinking_mode="invalid").validate()
+
+
 @pytest.mark.parametrize("first", [429, 503, "timeout", "connection", "envelope"])
 def test_retry_then_success(config_factory, first):
     count = 0

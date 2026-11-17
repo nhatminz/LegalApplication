@@ -54,6 +54,39 @@ def test_existing_run_requires_explicit_resume(config_factory, mock_transports):
         run(replace(config, resume=True, max_output_tokens=65536), mock_transports)
 
 
+@pytest.mark.parametrize("judge_mode,expected,effort", [
+    ("none", {}, None),
+    ("deepseek_vllm_xhigh", {"thinking": True, "reasoning_effort": 75}, "xhigh"),
+    ("high", {"thinking": True, "reasoning_effort": 50}, "high"),
+    ("max", {"thinking": True, "reasoning_effort": 100}, "max"),
+    ("63", {"thinking": True, "reasoning_effort": 63}, 63),
+    ("off", {"thinking": False}, None),
+])
+def test_judge_thinking_snapshot_and_resume_guard(config_factory, mock_transports, judge_mode, expected, effort):
+    config = config_factory(judge_thinking_mode=judge_mode)
+    run(config, mock_transports)
+    snapshot = json.loads((config.run_dir / "config.json").read_text())
+    assert snapshot["judge_thinking_mode"] == judge_mode
+    assert snapshot["judge_reasoning_parameters"] == expected
+    assert snapshot["judge_reasoning_effort"] == effort
+    assert snapshot["judge_thinking"]["parameters"] == ({"chat_template_kwargs": expected} if expected else {})
+    other_mode = "deepseek_vllm_xhigh" if judge_mode == "none" else "none"
+    with pytest.raises(ValueError, match="configuration/input/code differs"):
+        run(replace(config, resume=True, judge_thinking_mode=other_mode), mock_transports)
+    assert len(mock_transports[2]["judge"]) == 1
+
+
+def test_independent_tiers_in_one_full_run(config_factory, mock_transports):
+    config = config_factory(generator_thinking_mode="high", judge_thinking_mode="max")
+    run(config, mock_transports)
+    assert mock_transports[2]["generator"][0]["chat_template_kwargs"] == {"thinking": True, "reasoning_effort": 50}
+    assert mock_transports[2]["judge"][0]["chat_template_kwargs"] == {"thinking": True, "reasoning_effort": 100}
+    snapshot = json.loads((config.run_dir / "config.json").read_text())
+    assert snapshot["generator_thinking"]["effort_budget"] == 50
+    assert snapshot["judge_thinking"]["effort_budget"] == 100
+    assert "budget=100" in (config.run_dir / "run.log").read_text()
+
+
 def test_input_change_blocks_resume(config_factory, mock_transports):
     config = config_factory()
     run(config, mock_transports)

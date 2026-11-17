@@ -11,13 +11,9 @@ import httpx
 
 from .config import Config
 from .scoring import LABEL_SCHEMA
+from .thinking import thinking_parameters
 
 log = logging.getLogger(__name__)
-
-# Ported from LegalDataset/src/legal_issue_pipeline/llm/adapters.py:
-# DeepSeekVLLMAdapter: xhigh -> numeric template budget 75, not a top-level API tier.
-XHIGH_PARAMETERS = {"chat_template_kwargs": {"thinking": True, "reasoning_effort": 75}}
-
 
 class APIError(RuntimeError):
     def __init__(self, message: str, metadata: dict | None = None):
@@ -47,8 +43,7 @@ class APIClient:
     def body(self, messages: list[dict]) -> dict:
         result = {"model": self.model, "messages": messages, "stream": False,
                   "max_tokens": self.config.max_output_tokens}
-        if self.role == "judge" or self.config.generator_thinking_mode == "deepseek_vllm_xhigh":
-            result.update(XHIGH_PARAMETERS)
+        result.update(thinking_parameters(getattr(self.config, f"{self.role}_thinking_mode")))
         if self.role == "judge":
             result["response_format"] = (
                 {"type": "json_schema", "json_schema": {"name": "legal_application_labels", "strict": True, "schema": LABEL_SCHEMA}}
