@@ -14,7 +14,7 @@ Repository runtime:
 
 Bạn dùng môi trường `.venv` đã cài đầy đủ thư viện, đặt ở bất kỳ đâu. Các lệnh gọi `python` và `vllm` từ môi trường đã activate. Chạy các bước có inference trên B200.
 
-Luồng chạy: host Qwen3-4B trong terminal 1 → cấu hình client ở terminal 2 → làm sạch/validate input → chạy thử → chạy full → đọc kết quả. Judge là endpoint đã được cung cấp, không cần host lại Judge trong hướng dẫn này.
+Luồng chạy: statistic phân loại input gốc thành full/partial → host Qwen3-4B trong terminal 1 → Application đọc input đã gắn nhãn → lọc full_only/all → chạy thử/full → đọc kết quả. Judge là endpoint đã được cung cấp, không cần host lại Judge trong hướng dẫn này.
 
 ## 1. Activate môi trường hiện có
 
@@ -28,6 +28,56 @@ source "$LEGAL_ENV_DIR/bin/activate"
 ```
 
 Các bước sau giả định terminal đã dùng đúng môi trường này.
+
+### 1.1. Terminal 2: phân loại dữ liệu trước khi chạy Application
+
+Statistic chỉ cần Judge endpoint, không cần host Qwen. Chạy trên input gốc chưa có data_status; toàn bộ file nguồn được giữ nguyên. JSON/schema lỗi được báo và làm preflight dừng, không gọi clean_input để sửa nguồn.
+
+```bash
+export PROJECT_ROOT=/workspace/storage-shared/nlp/minhpn19/LegalApplication
+cd "$PROJECT_ROOT"
+export OUTPUT_DIR="$PROJECT_ROOT/outputs"
+export RAW_INPUT_JSONL="$PROJECT_ROOT/input/judgment_with_issues_sample.jsonl"
+export STAT_RUN_ID="completeness-$(TZ=Asia/Ho_Chi_Minh date +%Y%m%d-%H%M%S)-${RANDOM}"
+
+export JUDGE_BASE_URL=http://172.29.62.173:8000/v1
+export JUDGE_MODEL=DeepSeek-V4.1-Flash-1017
+export JUDGE_THINKING_MODE=deepseek_vllm_xhigh
+export JUDGE_RESPONSE_FORMAT=json_schema
+export JUDGE_API_KEY=EMPTY
+export BATCH_SIZE=20
+export JUDGE_CONCURRENCY=20
+export MAX_OUTPUT_TOKENS=32768
+export API_TIMEOUT_SECONDS=1800
+export API_MAX_RETRIES=3
+export JUDGE_JSON_RETRIES=2
+export RETRY_BACKOFF_SECONDS=2
+
+INPUT_JSONL="$RAW_INPUT_JSONL" RUN_ID="$STAT_RUN_ID" LIMIT=all RESUME=0 \
+  bash scripts/statistic.sh
+
+python -m json.tool "$OUTPUT_DIR/$STAT_RUN_ID/summary.json"
+```
+
+`full`: facts_clean đủ dữ kiện thực tế cho mọi issue đã được Tòa giải quyết; `partial`: ít nhất một issue thiếu tình tiết/chứng cứ quyết định trong application/conclusion. Diễn đạt tương đương hoặc thiếu diễn giải pháp luật không tự làm sample partial. Details có phân tích đủ issues và quotes được kiểm tra nguyên văn với đúng nguồn.
+
+Chỉ tiếp tục Application khi `classified_output_complete=true`. Nếu còn API/schema/evidence errors hoặc Judge không phân loại được, kết quả thành công được lưu vào `classified_input.partial.jsonl`, lỗi vào errors.jsonl; không có nhãn giả và không có classified_input.jsonl hoàn chỉnh. Tỷ lệ full/partial dùng số phân loại thành công làm mẫu số; tỷ lệ lỗi báo riêng trên selected. Resume bằng đúng exports và STAT_RUN_ID ở trên:
+
+```bash
+INPUT_JSONL="$RAW_INPUT_JSONL" RUN_ID="$STAT_RUN_ID" LIMIT=all RESUME=1 \
+  bash scripts/statistic.sh
+```
+
+Khi toàn bộ selected samples thành công, file classified_input.jsonl giữ nguyên toàn bộ object gốc, chỉ thêm data_status, theo đúng thứ tự input. LIMIT=all phân loại toàn bộ; nếu chỉ thử LIMIT=5 thì file hoàn chỉnh chỉ bao gồm 5 samples được chọn, không phải toàn dataset. Dùng RUN_ID mới nếu đổi LIMIT.
+
+Sau khi hoàn tất, đặt input Application từ chính run phân loại này:
+
+```bash
+export CLASSIFIED_INPUT_JSONL="$OUTPUT_DIR/$STAT_RUN_ID/classified_input.jsonl"
+export INPUT_JSONL="$CLASSIFIED_INPUT_JSONL"
+```
+
+Nếu ở terminal khác, điền đường dẫn classified_input.jsonl thực tế của run đã hoàn tất, không dùng file raw hoặc file partial chưa hoàn chỉnh.
 
 ## 2. Terminal 1: host checkpoint Qwen3-4B
 
@@ -81,8 +131,9 @@ Sau khi activate môi trường ở terminal 2, copy toàn bộ khối sau:
 export PROJECT_ROOT=/workspace/storage-shared/nlp/minhpn19/LegalApplication
 cd "$PROJECT_ROOT"
 
-# Input thực tế. Có thể thay dòng này bằng file JSONL lớn hơn của bạn.
-export INPUT_JSONL="$PROJECT_ROOT/input/judgment_with_issues_sample.jsonl"
+# Input đã phân loại ở bước 1.1, bắt buộc data_status full/partial trên mọi record.
+export INPUT_JSONL="$CLASSIFIED_INPUT_JSONL"
+export DATA_STATUS_USED=all  # all | full_only
 
 # Model được đánh giá, đã host ở terminal 1.
 export GENERATOR_BASE_URL=http://127.0.0.1:8001/v1
@@ -200,13 +251,13 @@ python -m json.tool "$OUTPUT_DIR/$CHECK_RUN_ID/input_cleanup.json"
 
 Hành vi của bước này:
 
-- Quét toàn bộ input, kể cả khi một lần chạy có LIMIT nhỏ.
+- Quét toàn bộ input có nhãn, kể cả khi một lần chạy có LIMIT nhỏ. Nếu data_status thiếu/sai thì fail rõ ràng, không đoán hoặc xóa record vì lỗi nhãn.
 - Ghi dòng không parse được JSON/UTF-8 vào `removed_input_lines.jsonl`, rồi **xóa dòng đó khỏi chính INPUT_JSONL** và tiếp tục với dòng sau.
 - Giữ nguyên nội dung/thứ tự các dòng còn lại; LIMIT tính trên samples hợp lệ sau cleanup.
 - Nếu JSON parse được nhưng thiếu trường bắt buộc, issues rỗng/sai kiểu hoặc thiếu nội dung luật, lưu nguyên record vào removal log rồi xóa khỏi input và tiếp tục. Với doc_name trùng, giữ record hợp lệ đầu tiên, log và loại các bản sau. Không tự sinh issues/facts/luật để bù dữ liệu thiếu.
 - Không gọi generator hoặc Judge.
 
-Tệp mẫu trong workspace đã được làm sạch từ 7 dòng xuống 6 records hợp lệ. Nếu bản sao trên B200 vẫn còn dòng 7 bị cắt, bước này sẽ tự log và xóa dòng lỗi đó. Với file có 6 records thì chỉ chạy được tối đa 6 samples; cần input có ít nhất 20 records hợp lệ để có batch đủ 20 samples.
+Tệp mẫu raw trong workspace có 6 records hợp lệ nhưng chưa gắn nhãn; phải chạy statistic ở bước 1.1 trước. Statistic không tự xóa lỗi nguồn. Với file có 6 records thì chỉ chạy được tối đa 6 samples; cần input có ít nhất 20 records hợp lệ đủ điều kiện filter để có batch đủ 20 samples.
 
 Đọc chi tiết các dòng đã xóa mà không in bản base64 dài:
 
@@ -264,7 +315,7 @@ Giữ INPUT_JSONL đang dùng nếu muốn chạy toàn bộ file đó. Nếu ch
 
 ```bash
 # Chỉ bỏ comment và thay tên file nếu bạn chuyển sang input khác:
-# export INPUT_JSONL="$PROJECT_ROOT/input/TEN_FILE_DU_LIEU_THUC_TE.jsonl"
+# export INPUT_JSONL="$PROJECT_ROOT/outputs/TEN_RUN_PHAN_LOAI/classified_input.jsonl"
 
 export FULL_RUN_ID="qwen3-4b-full-$(TZ=Asia/Ho_Chi_Minh date +%Y%m%d-%H%M%S)-${RANDOM}"
 
@@ -277,6 +328,21 @@ MODE=validate-only LIMIT=all RUN_ID="${FULL_RUN_ID}-validate" RESUME=0 \
 Lệnh full chỉ chạy khi validation thành công. Cấu hình đã export ở bước 3 sẽ xử lý mỗi batch tối đa 20 samples: tối đa 20 generator requests đồng thời, sau đó tối đa 20 Judge requests đồng thời. Batch cuối ít hơn 20 vẫn chạy hết. Không có giới hạn tổng mặc định 1000 samples.
 
 Nếu muốn **tổng cộng 20 samples**, dùng LIMIT=20 trong một run mới. Nếu muốn **toàn bộ dataset nhưng mỗi lượt 20**, dùng LIMIT=all như trên.
+
+Để chỉ đánh giá samples full, lọc trước LIMIT. Ví dụ dưới chọn tối đa 100 full samples, không phải lọc 100 dòng đầu; partial vẫn nằm nguyên trong input:
+
+```bash
+MODE=full DATA_STATUS_USED=full_only LIMIT=100 RESUME=0 \
+  RUN_ID="qwen3-full-only-$(TZ=Asia/Ho_Chi_Minh date +%Y%m%d-%H%M%S)-${RANDOM}" \
+  bash "$PROJECT_ROOT/scripts/run_application.sh"
+
+# Đánh giá cả full và partial trong một run mới:
+MODE=full DATA_STATUS_USED=all LIMIT=all RESUME=0 \
+  RUN_ID="qwen3-all-$(TZ=Asia/Ho_Chi_Minh date +%Y%m%d-%H%M%S)-${RANDOM}" \
+  bash "$PROJECT_ROOT/scripts/run_application.sh"
+```
+
+Ứng dụng kiểm tra nhãn toàn file kể cả phần ngoài LIMIT. DATA_STATUS_USED áp dụng cho full/judge-only/validate-only, được lưu trong config và phải giữ nguyên khi resume. Summary có data_status_counts.input/selected/completed theo full/partial, filtered_out và eligible; mapping giữ nguyên doc_name, input_index và hash của file có nhãn.
 
 Giới hạn concurrency là số request client có thể gửi đồng thời; số sequences server thực sự chạy tại một thời điểm còn phụ thuộc scheduler và KV cache.
 
@@ -384,7 +450,7 @@ fields = [
     "generator_base_url", "generator_model", "judge_base_url", "judge_model",
     "batch_size", "generator_concurrency", "judge_concurrency", "max_output_tokens",
     "timeout_seconds", "api_max_retries", "judge_json_retries", "retry_backoff",
-    "generator_thinking_mode", "judge_thinking_mode", "judge_response_format",
+    "generator_thinking_mode", "judge_thinking_mode", "judge_response_format", "data_status_used",
 ]
 aliases = {"timeout_seconds": "API_TIMEOUT_SECONDS", "retry_backoff": "RETRY_BACKOFF_SECONDS"}
 exports = []

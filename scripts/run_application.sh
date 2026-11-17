@@ -26,6 +26,7 @@ export RUN_ID="${RUN_ID:-}"  # Empty -> Vietnam local timestamp + random suffix.
 export MODE="${MODE:-full}"  # full | judge-only | validate-only
 export GENERATION_JSONL="${GENERATION_JSONL:-}"
 export RESUME="${RESUME:-0}"
+export DATA_STATUS_USED="${DATA_STATUS_USED:-all}"  # all | full_only; input phải có data_status.
 
 # MODEL JUDGE: chấm bài làm của generator, mặc định DeepSeek với effort xhigh.
 export JUDGE_BASE_URL="${JUDGE_BASE_URL:-http://172.29.62.173:8000/v1}"

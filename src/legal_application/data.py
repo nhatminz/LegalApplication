@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from tqdm import tqdm
@@ -116,12 +116,19 @@ class Dataset:
     samples: list[Sample]
     input_count: int
     sha256: str
+    status_counts: dict[str, int] = field(default_factory=dict)
+    eligible_count: int = 0
+    filtered_out: int = 0
 
 
-def read_dataset(path: Path, limit: int | None) -> Dataset:
+def read_dataset(path: Path, limit: int | None, data_status_used: str | None = None) -> Dataset:
     """Validate every line, including those beyond LIMIT; retain only selected samples."""
     selected, errors, seen = [], [], set()
     count = valid = 0
+    status_counts = {"full": 0, "partial": 0}
+    eligible = filtered_out = 0
+    if data_status_used not in {None, "all", "full_only"}:
+        raise ValueError("DATA_STATUS_USED must be all or full_only")
     digest = hashlib.sha256()
     with path.open("rb") as handle, tqdm(total=path.stat().st_size, desc="Validate input", unit="B",
                                          unit_scale=True, dynamic_ncols=True, disable=None) as progress:
@@ -133,8 +140,16 @@ def read_dataset(path: Path, limit: int | None) -> Dataset:
                 if sample.doc_name in seen:
                     raise ValueError(f"duplicate doc_name {sample.doc_name!r}")
                 seen.add(sample.doc_name)
+                status = sample.raw.get("data_status")
+                if data_status_used is not None and (not isinstance(status, str) or status not in status_counts):
+                    raise ValueError("data_status must be full or partial; run scripts/statistic.sh first")
+                if isinstance(status, str) and status in status_counts:
+                    status_counts[status] += 1
                 valid += 1
-                if limit is None or len(selected) < limit:
+                included = data_status_used != "full_only" or status == "full"
+                eligible += int(included)
+                filtered_out += int(not included)
+                if included and (limit is None or len(selected) < limit):
                     selected.append(sample)
             except (ValueError, UnicodeError) as exc:
                 errors.append({"input_index": index, "input_line": index + 1, "error": str(exc)})
@@ -144,5 +159,5 @@ def read_dataset(path: Path, limit: int | None) -> Dataset:
         errors.append({"input_line": None, "error": "Input JSONL is empty"})
     if errors:
         raise DatasetError(errors, count, valid)
-    return Dataset(selected, count, digest.hexdigest())
+    return Dataset(selected, count, digest.hexdigest(), status_counts, eligible, filtered_out)
 

@@ -40,19 +40,19 @@ class APIClient:
         self.semaphore = asyncio.Semaphore(getattr(config, f"{role}_concurrency"))
         self.http = httpx.AsyncClient(timeout=config.timeout_seconds, transport=transport, trust_env=False)
 
-    def body(self, messages: list[dict]) -> dict:
+    def body(self, messages: list[dict], *, schema: dict | None = None) -> dict:
         result = {"model": self.model, "messages": messages, "stream": False,
                   "max_tokens": self.config.max_output_tokens}
         result.update(thinking_parameters(getattr(self.config, f"{self.role}_thinking_mode")))
         if self.role == "judge":
             result["response_format"] = (
-                {"type": "json_schema", "json_schema": {"name": "legal_application_labels", "strict": True, "schema": LABEL_SCHEMA}}
+                {"type": "json_schema", "json_schema": {"name": "legal_application_labels", "strict": True, "schema": LABEL_SCHEMA if schema is None else schema}}
                 if self.config.judge_response_format == "json_schema" else {"type": "json_object"}
             )
         return result
 
-    async def complete(self, messages: list[dict], *, doc_name: str) -> Completion:
-        body = self.body(messages)
+    async def complete(self, messages: list[dict], *, doc_name: str, schema: dict | None = None) -> Completion:
+        body = self.body(messages, schema=schema)
         request_id = uuid4().hex
         start = time.monotonic()
         attempts = []

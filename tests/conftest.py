@@ -12,6 +12,7 @@ from legal_application.config import Config
 def make_record(doc="case-1", n=2):
     return {
         "doc_name": doc,
+        "data_status": "full",
         "benchmark_seed": {"facts": "RAW_FACTS_SENTINEL", "facts_clean": "A yêu cầu B hoàn trả 100 đồng; B phủ nhận đã nhận tiền.",
                            "application": "PRIVATE_APPLICATION_SENTINEL: Chứng cứ xác định B nhận 100 đồng, phải hoàn trả.",
                            "conclusion": "PRIVATE_CONCLUSION_SENTINEL: Buộc B trả A 100 đồng.", "extra": {"keep": "FULL_SEED"}},

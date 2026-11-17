@@ -105,6 +105,8 @@ async def judge_sample(config: Config, sample: Sample, generation: dict, client:
 
 
 class Pipeline:
+    allowed_modes = {"full", "judge-only", "validate-only"}
+
     def __init__(self, config: Config, *, generator_transport=None, judge_transport=None):
         self.config = config
         self.generator_transport, self.judge_transport = generator_transport, judge_transport
@@ -152,6 +154,14 @@ class Pipeline:
                            "pending": selected - len(self.evaluations) - len(failed_docs),
                            "skipped": self.preexisting_evaluations, "scored": len(scored), "needs_review": review},
                 "input_cleanup": self.input_cleanup,
+                "data_status_used": self.config.data_status_used,
+                "data_status_counts": {"input": dataset.status_counts,
+                                       "filtered_out": dataset.filtered_out,
+                                       "eligible": dataset.eligible_count,
+                                       "selected": {group: sum(s.raw["data_status"] == group for s in dataset.samples)
+                                                    for group in ["full", "partial"]},
+                                       "completed": {group: sum(s.raw["data_status"] == group and s.doc_name in self.evaluations
+                                                                 for s in dataset.samples) for group in ["full", "partial"]}},
                 "generation": stage("generation", self.generations, generation_failures),
                 "evaluation": stage("evaluation", self.evaluations, evaluation_failures),
                 "mean_score": mean(r["score_components"]["total"] for r in scored) if scored else None,
@@ -166,6 +176,8 @@ class Pipeline:
     async def run(self) -> dict:
         config = self.config
         config.validate()
+        if config.mode not in self.allowed_modes:
+            raise ValueError(f"Unsupported mode {config.mode} for {type(self).__name__}")
         with RunStore(config) as store:
             handler = logging.FileHandler(store.path / "run.log", encoding="utf-8")
             handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
@@ -202,6 +214,16 @@ class Pipeline:
                     "judge_reasoning_effort": judge_thinking["effort"],
                     "judge_reasoning_parameters": judge_thinking["parameters"].get("chat_template_kwargs", {})}
         log.info("Run start run_id=%s mode=%s limit=%s batch_size=%d invocation=%s", config.run_id, config.mode, config.limit, config.batch_size, self.invocation_id)
+        # Validate labels across ALL records before the existing cleanup can mutate input.
+        # This also protects filtered records and records beyond LIMIT from guessed labels.
+        with config.input_jsonl.open("rb") as source:
+            for line_number, line in enumerate(source, 1):
+                try:
+                    raw = strict_json(line.decode("utf-8"))
+                except (ValueError, UnicodeError):
+                    continue  # Existing cleanup journals malformed JSON separately.
+                if isinstance(raw, dict) and raw.get("data_status") not in ("full", "partial"):
+                    raise ValueError(f"{config.input_jsonl}:{line_number}: data_status must be full or partial; run scripts/statistic.sh first")
         self.input_cleanup = clean_input(config.input_jsonl, store.path,
                                         lambda digest: store.configure({**snapshot, "input_sha256": digest}))
         snapshot["input_sha256"] = self.input_cleanup["input_sha256_after"]
@@ -210,7 +232,7 @@ class Pipeline:
                      settings["requested_mode"], settings["backend"], settings["thinking_enabled"],
                      settings["effort_budget"], settings["parameters"])
         try:
-            dataset = read_dataset(config.input_jsonl, config.limit)
+            dataset = read_dataset(config.input_jsonl, config.limit, config.data_status_used)
         except DatasetError as exc:
             for error in exc.errors:
                 log.error("Input invalid line=%s error=%s", error["input_line"], error["error"])

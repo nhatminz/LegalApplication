@@ -77,7 +77,7 @@ def test_invalid_encoding_blank_and_strict_json_logged_exactly(tmp_path, bad):
 
 def test_valid_json_with_wrong_schema_removed_and_run_continues(config_factory, mock_transports):
     config = config_factory()
-    bad_schema = json.dumps({"doc_name": "missing-fields"}) + "\n"
+    bad_schema = json.dumps({"doc_name": "missing-fields", "data_status": "full"}) + "\n"
     with config.input_jsonl.open("a") as output:
         output.write(bad_schema)
     summary = invoke(config, mock_transports)

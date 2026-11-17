@@ -47,6 +47,7 @@ class Config:
     generator_thinking_mode: str = "none"
     judge_thinking_mode: str = "deepseek_vllm_xhigh"
     judge_response_format: str = "json_schema"
+    data_status_used: str = "all"
     generator_api_key: str = field(default="EMPTY", repr=False)
     judge_api_key: str = field(default="EMPTY", repr=False)
 
@@ -79,6 +80,7 @@ class Config:
             generator_thinking_mode=e.get("GENERATOR_THINKING_MODE", "none"),
             judge_thinking_mode=e.get("JUDGE_THINKING_MODE", "deepseek_vllm_xhigh"),
             judge_response_format=e.get("JUDGE_RESPONSE_FORMAT", "json_schema"),
+            data_status_used=e.get("DATA_STATUS_USED", "all"),
             generator_api_key=e.get("GENERATOR_API_KEY", "EMPTY"), judge_api_key=e.get("JUDGE_API_KEY", "EMPTY"),
         )
 
@@ -89,8 +91,10 @@ class Config:
     def validate(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", self.run_id):
             raise ValueError("RUN_ID must be a simple filename (letters, numbers, _, ., -)")
-        if self.mode not in {"full", "judge-only", "validate-only"}:
-            raise ValueError("MODE must be full, judge-only, or validate-only")
+        if self.mode not in {"full", "judge-only", "validate-only", "statistic"}:
+            raise ValueError("MODE must be full, judge-only, validate-only, or statistic")
+        if self.data_status_used not in {"all", "full_only"}:
+            raise ValueError("DATA_STATUS_USED must be all or full_only")
         if self.mode == "full" and not (self.generator_model.strip() and self.generator_base_url):
             raise ValueError("GENERATOR_MODEL and GENERATOR_BASE_URL are required in full mode")
         if self.mode == "judge-only" and self.generation_jsonl is None:

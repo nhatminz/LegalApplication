@@ -8,6 +8,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+from collections.abc import Iterable
 
 from .config import Config
 from .data import strict_json
@@ -55,6 +56,19 @@ def append_jsonl(path: Path, value: dict) -> None:
         handle.write(json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def atomic_jsonl(path: Path, records: Iterable[dict]) -> None:
+    temp = path.with_name(path.name + ".tmp." + uuid4().hex)
+    try:
+        with temp.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def read_jsonl(path: Path, *, repair_tail: bool = False) -> list[dict]:
@@ -124,14 +138,14 @@ class RunStore:
             fcntl.flock(self.lock, fcntl.LOCK_UN)
             self.lock.close()
 
-    def configure(self, snapshot: dict) -> None:
+    def configure(self, snapshot: dict, artifact_names=None) -> None:
         path = self.path / "config.json"
         if self.config.resume:
             if not path.exists() or strict_json(path.read_text()) != snapshot:
                 raise ValueError("Resume configuration/input/code differs from config.json; use a new RUN_ID")
         else:
             atomic_json(path, snapshot)
-        for name in ["generations.jsonl", "evaluations.jsonl", "errors.jsonl"]:
+        for name in artifact_names if artifact_names is not None else ["generations.jsonl", "evaluations.jsonl", "errors.jsonl"]:
             (self.path / name).touch(exist_ok=True)
 
     def load(self, name: str) -> list[dict]:
