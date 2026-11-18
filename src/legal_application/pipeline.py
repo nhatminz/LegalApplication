@@ -15,6 +15,7 @@ from .input_cleanup import clean_input
 from .prompts import generator_messages, judge_messages
 from .scoring import LABEL_SCHEMA, LabelError, score_labels
 from .storage import RunStore, file_hash, implementation_hash, now, read_jsonl
+from .filter_full import verify_full_manifest
 from .thinking import resolve_thinking
 
 log = logging.getLogger(__name__)
@@ -154,13 +155,13 @@ class Pipeline:
                            "pending": selected - len(self.evaluations) - len(failed_docs),
                            "skipped": self.preexisting_evaluations, "scored": len(scored), "needs_review": review},
                 "input_cleanup": self.input_cleanup,
-                "data_status_used": self.config.data_status_used,
+                "data_status_used": "full_only",
                 "data_status_counts": {"input": dataset.status_counts,
                                        "filtered_out": dataset.filtered_out,
                                        "eligible": dataset.eligible_count,
-                                       "selected": {group: sum(s.raw["data_status"] == group for s in dataset.samples)
+                                       "selected": {group: sum(s.data_status == group for s in dataset.samples)
                                                     for group in ["full", "partial"]},
-                                       "completed": {group: sum(s.raw["data_status"] == group and s.doc_name in self.evaluations
+                                       "completed": {group: sum(s.data_status == group and s.doc_name in self.evaluations
                                                                  for s in dataset.samples) for group in ["full", "partial"]}},
                 "generation": stage("generation", self.generations, generation_failures),
                 "evaluation": stage("evaluation", self.evaluations, evaluation_failures),
@@ -208,7 +209,9 @@ class Pipeline:
         config = self.config
         generator_thinking = resolve_thinking(config.generator_thinking_mode)
         judge_thinking = resolve_thinking(config.judge_thinking_mode)
+        full_manifest = verify_full_manifest(config.input_jsonl)
         snapshot = {**config.snapshot(), "artifact_version": 1, "implementation_sha256": implementation_hash(),
+                    "full_input_manifest_sha256": file_hash(config.input_jsonl.with_name(config.input_jsonl.name + ".manifest.json")) if full_manifest else None,
                     "generation_source_sha256": file_hash(config.generation_jsonl) if config.generation_jsonl else None,
                     "generator_thinking": generator_thinking, "judge_thinking": judge_thinking,
                     "judge_reasoning_effort": judge_thinking["effort"],
@@ -223,7 +226,10 @@ class Pipeline:
                 except (ValueError, UnicodeError):
                     continue  # Existing cleanup journals malformed JSON separately.
                 if isinstance(raw, dict) and raw.get("data_status") not in ("full", "partial"):
-                    raise ValueError(f"{config.input_jsonl}:{line_number}: data_status must be full or partial; run scripts/statistic.sh first")
+                    if not full_manifest or "data_status" in raw:
+                        raise ValueError(f"{config.input_jsonl}:{line_number}: data_status must be full or partial; use scripts/filter_full.sh for raw input")
+                if full_manifest and isinstance(raw, dict) and raw.get("data_status", "full") != "full":
+                    raise ValueError("Full-input manifest contradicts the record's data_status")
         self.input_cleanup = clean_input(config.input_jsonl, store.path,
                                         lambda digest: store.configure({**snapshot, "input_sha256": digest}))
         snapshot["input_sha256"] = self.input_cleanup["input_sha256_after"]
@@ -232,7 +238,7 @@ class Pipeline:
                      settings["requested_mode"], settings["backend"], settings["thinking_enabled"],
                      settings["effort_budget"], settings["parameters"])
         try:
-            dataset = read_dataset(config.input_jsonl, config.limit, config.data_status_used)
+            dataset = read_dataset(config.input_jsonl, config.limit, application=True, verified_full=bool(full_manifest))
         except DatasetError as exc:
             for error in exc.errors:
                 log.error("Input invalid line=%s error=%s", error["input_line"], error["error"])
@@ -248,6 +254,8 @@ class Pipeline:
             raise
         if dataset.sha256 != snapshot["input_sha256"]:
             raise ValueError("Input changed during validation; no API requests made")
+        if full_manifest and (dataset.sha256 != full_manifest["output_sha256"] or dataset.valid_count != full_manifest["sample_count"]):
+            raise ValueError("Full-input manifest no longer matches the validated input")
         self.input_count = dataset.input_count
         self.selected_count = len(dataset.samples)
         samples = {s.doc_name: s for s in dataset.samples}

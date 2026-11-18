@@ -80,6 +80,8 @@ class APIClient:
                 metadata = {"request_id": request_id, "api_response_id": data.get("id"),
                             "response_model": data.get("model"), "finish_reason": choice.get("finish_reason"),
                             "usage": data.get("usage"), "http_attempts": attempt + 1,
+                            "content_characters": len(content) if isinstance(content, str) else 0,
+                            "requested_max_tokens": body["max_tokens"],
                             "retry_errors": attempts, "latency_seconds": time.monotonic() - start,
                             "actual_thinking_parameters": {k: body[k] for k in ["chat_template_kwargs"] if k in body}}
                 if choice.get("finish_reason") not in {"stop", None}:

@@ -16,9 +16,9 @@ from pathlib import Path
 from uuid import uuid4
 
 from legal_application.config import Config, rooted
-from legal_application.storage import append_jsonl, atomic_json, file_hash, implementation_hash, now
+from legal_application.storage import append_jsonl, atomic_json, now
 from legal_application.data import strict_json
-from legal_application.thinking import resolve_thinking
+from legal_application.statistic import statistic_snapshot
 
 LEGACY_PROJECT_ROOT = "/workspace/storage-shared/nlp/minhpn19/LegalApplication"
 DEFAULT_PROJECT_ROOT = "/workspace/storage-shared/nlp/users/minhpn19/LegalApplication"
@@ -78,6 +78,8 @@ def prepare_resume(root: Path, output_dir: Path, run_id: str, *, batch_size: int
                 updated["input_jsonl"] = str(rooted(root, str(input_jsonl)))
             elif old_input.is_relative_to(old_root):
                 updated["input_jsonl"] = str((root / old_input.relative_to(old_root)).resolve())
+            if saved.get("statistic_seed_jsonl") and Path(saved["statistic_seed_jsonl"]).is_relative_to(old_root):
+                updated["statistic_seed_jsonl"] = str((root / Path(saved["statistic_seed_jsonl"]).relative_to(old_root)).resolve())
             # Inputs outside the old project (e.g. LegalDataset) keep their original path.
         if batch_size is not None:
             updated["batch_size"] = batch_size
@@ -85,27 +87,22 @@ def prepare_resume(root: Path, output_dir: Path, run_id: str, *, batch_size: int
             updated["judge_concurrency"] = judge_concurrency
         allowed = {field.name for field in fields(Config)}
         values = {key: value for key, value in updated.items() if key in allowed}
-        for key in ["project_root", "input_jsonl", "output_dir"]:
-            values[key] = Path(values[key])
+        for key in ["project_root", "input_jsonl", "output_dir", "statistic_seed_jsonl"]:
+            if values.get(key) is not None:
+                values[key] = Path(values[key])
         config = Config(**values)
         config.validate()
-        expected = config.snapshot()
-        for key in list(expected):
-            if key.startswith("generator_") or key in {"generation_jsonl", "data_status_used"}:
-                expected.pop(key)
-        expected.update(pipeline_kind="data_completeness", artifact_version=1,
-                        input_sha256=file_hash(config.input_jsonl), implementation_sha256=implementation_hash(),
-                        judge_thinking=resolve_thinking(config.judge_thinking_mode))
+        expected = statistic_snapshot(config)
         if updated.get("implementation_sha256") != expected["implementation_sha256"]:
             if relocate and updated.get("implementation_sha256") in path_default_compatibility_hashes():
                 updated["implementation_sha256"] = expected["implementation_sha256"]
             else:
-                raise ValueError("Pipeline code differs from the run. Relocation can migrate only the verified default-path change")
+                raise ValueError("Pipeline code differs from the run. Relocation can migrate only the verified default-path change; use scripts/retry_statistic.sh to import successes into a new run with updated code")
         if expected != updated:
             raise ValueError("Input/config differs from the saved run. Input bytes, Judge and evaluation settings must remain unchanged")
         changes = {key: {"old": saved[key], "new": updated[key]}
-                   for key in ["project_root", "output_dir", "input_jsonl", "implementation_sha256", "batch_size", "judge_concurrency"]
-                   if saved[key] != updated[key]}
+                   for key in ["project_root", "output_dir", "input_jsonl", "statistic_seed_jsonl", "implementation_sha256", "batch_size", "judge_concurrency"]
+                   if saved.get(key) != updated.get(key)}
         if changes:
             change_id = uuid4().hex
             backup = run_dir / f"config.before-resume-{change_id}.json"
@@ -129,7 +126,8 @@ def resume_environment(snapshot: dict) -> dict:
             value = "all" if key == "limit" else ""
         environment[aliases.get(key, key.upper())] = str(value)
     # These fields do not participate in statistic requests/snapshots.
-    environment.update(RESUME="1", MODE="statistic", DATA_STATUS_USED="all", GENERATION_JSONL="",
+    environment.pop("DATA_STATUS_USED", None)
+    environment.update(RESUME="1", MODE="statistic", GENERATION_JSONL="",
                        GENERATOR_THINKING_MODE="none", GENERATOR_CONCURRENCY="20")
     return environment
 

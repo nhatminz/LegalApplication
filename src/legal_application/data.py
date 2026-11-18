@@ -39,6 +39,7 @@ class Sample:
     input_index: int  # zero-based physical JSONL line; input_line = input_index + 1
     raw: dict
     law_blocks: list[dict]
+    data_status: str | None = None
 
     @property
     def doc_name(self) -> str:
@@ -103,7 +104,7 @@ def parse_sample(raw: object, input_index: int) -> Sample:
             body = text_field(content.get(key), f"{prefix}.law_content.{key}")
             blocks.append({"law_index": i, "provision_index": None, "law_str": name, "citation_str": None,
                            "content": body, "source": f"{prefix}.law_content.{key}", "fallback": True})
-    return Sample(input_index, raw, blocks)
+    return Sample(input_index, raw, blocks, raw.get("data_status"))
 
 
 class DatasetError(ValueError):
@@ -124,15 +125,13 @@ class Dataset:
     validation_errors: list[dict] = field(default_factory=list)
 
 
-def read_dataset(path: Path, limit: int | None, data_status_used: str | None = None, *,
+def read_dataset(path: Path, limit: int | None, *, application: bool = False, verified_full: bool = False,
                  skip_invalid: bool = False, on_invalid: Callable[[dict, bytes], None] | None = None) -> Dataset:
     """Validate every line, including those beyond LIMIT; retain only selected samples."""
     selected, errors, seen = [], [], set()
     count = valid = 0
     status_counts = {"full": 0, "partial": 0}
     eligible = filtered_out = 0
-    if data_status_used not in {None, "all", "full_only"}:
-        raise ValueError("DATA_STATUS_USED must be all or full_only")
     digest = hashlib.sha256()
     with path.open("rb") as handle, tqdm(total=path.stat().st_size, desc="Validate input", unit="B",
                                          unit_scale=True, dynamic_ncols=True, disable=None) as progress:
@@ -149,13 +148,17 @@ def read_dataset(path: Path, limit: int | None, data_status_used: str | None = N
                     validation_stage = "duplicate_doc_name"
                     raise ValueError(f"duplicate doc_name {sample.doc_name!r}")
                 seen.add(sample.doc_name)
-                status = sample.raw.get("data_status")
-                if data_status_used is not None and (not isinstance(status, str) or status not in status_counts):
-                    raise ValueError("data_status must be full or partial; run scripts/statistic.sh first")
+                status = sample.data_status
+                if verified_full and status is None and "data_status" not in sample.raw:
+                    status = sample.data_status = "full"
+                if application and (not isinstance(status, str) or status not in status_counts):
+                    raise ValueError("data_status must be full or partial, or use the unchanged output and manifest from scripts/filter_full.sh")
+                if verified_full and status != "full":
+                    raise ValueError("Full-input manifest contradicts the record's data_status")
                 if isinstance(status, str) and status in status_counts:
                     status_counts[status] += 1
                 valid += 1
-                included = data_status_used != "full_only" or status == "full"
+                included = not application or status == "full"
                 eligible += int(included)
                 filtered_out += int(not included)
                 if included and (limit is None or len(selected) < limit):

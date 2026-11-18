@@ -7,18 +7,33 @@ import json
 import logging
 import os
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 from tqdm import tqdm
 
 from .api import APIClient, APIError
-from .completeness import COMPLETENESS_SCHEMA, classify_sample, validate_classification
-from .data import DatasetError, read_dataset, strict_json
+from .completeness import COMPLETENESS_SCHEMA, classify_sample, parse_classification, validate_classification
+from .data import DatasetError, read_dataset
+from .evidence import EVIDENCE_FORMAT
 from .pipeline import Pipeline, bounded_map, index_records
-from .storage import atomic_jsonl, file_hash, implementation_hash, now
+from .storage import atomic_jsonl, file_hash, implementation_hash, now, read_jsonl
 from .thinking import resolve_thinking
 
 log = logging.getLogger(__name__)
+
+
+def statistic_snapshot(config) -> dict:
+    snapshot = config.snapshot()
+    for key in list(snapshot):
+        if key.startswith("generator_") or key == "generation_jsonl":
+            snapshot.pop(key)
+    snapshot.update(pipeline_kind="data_completeness", artifact_version=1,
+                    input_sha256=file_hash(config.input_jsonl), implementation_sha256=implementation_hash(),
+                    statistic_seed_sha256=file_hash(config.statistic_seed_jsonl) if config.statistic_seed_jsonl else None,
+                    statistic_evidence_format=EVIDENCE_FORMAT,
+                    judge_thinking=resolve_thinking(config.judge_thinking_mode))
+    return snapshot
 
 
 class StatisticPipeline(Pipeline):
@@ -89,6 +104,11 @@ class StatisticPipeline(Pipeline):
         full = [s.doc_name for s in samples if self.classifications.get(s.doc_name, {}).get("data_status") == "full"]
         partial = [s.doc_name for s in samples if self.classifications.get(s.doc_name, {}).get("data_status") == "partial"]
         failed = {e["doc_name"] for e in self.errors if e.get("stage") == "classification"} - self.classifications.keys()
+        latest_failures = {e["doc_name"]: e for e in self.errors if e.get("stage") == "classification" and e["doc_name"] in failed}
+        failure_reasons = Counter()
+        for error in latest_failures.values():
+            metadata = error.get("metadata") or {}
+            failure_reasons[metadata.get("last_validation_error") or (metadata.get("validation_errors") or [error["error"]])[-1]] += 1
         processed = len(full) + len(partial)
         complete = self.dataset is not None and processed == len(samples)
         return {"run_id": self.config.run_id, "status": status, "updated_at": now(),
@@ -109,7 +129,7 @@ class StatisticPipeline(Pipeline):
                 "classified_output_complete": complete and status in {"completed", "completed_with_input_errors"},
                 "classified_output": "classified_input.jsonl" if complete and status in {"completed", "completed_with_input_errors"} else None,
                 "partial_output": "classified_input.partial.jsonl" if self.dataset and not complete else None,
-                "judge_model": self.config.judge_model, "mean_score": None}
+                "failure_reasons": dict(failure_reasons), "judge_model": self.config.judge_model, "mean_score": None}
 
     def _export(self, store, *, allow_complete: bool = True) -> None:
         if self.dataset is None:
@@ -150,13 +170,7 @@ class StatisticPipeline(Pipeline):
 
     async def _classify(self, store) -> dict:
         config = self.config
-        snapshot = config.snapshot()
-        for key in list(snapshot):
-            if key.startswith("generator_") or key in {"generation_jsonl", "data_status_used"}:
-                snapshot.pop(key)
-        snapshot.update(pipeline_kind="data_completeness", artifact_version=1,
-                        input_sha256=file_hash(config.input_jsonl), implementation_sha256=implementation_hash(),
-                        judge_thinking=resolve_thinking(config.judge_thinking_mode))
+        snapshot = statistic_snapshot(config)
         store.configure(snapshot, artifact_names=["classification_details.jsonl", "errors.jsonl"])
         self.configured = True
         log.info("Statistic start run_id=%s limit=%s batch_size=%d judge=%s thinking=%s", config.run_id,
@@ -171,12 +185,20 @@ class StatisticPipeline(Pipeline):
                 raise ValueError(f"Statistic expects original unlabelled input; data_status already exists: {sample.doc_name}")
         samples = {s.doc_name: s for s in dataset.samples}
         self.classifications = index_records(store.load("classification_details.jsonl"), samples)
+        seeds = {}
+        if config.statistic_seed_jsonl:
+            for doc, record in index_records(read_jsonl(config.statistic_seed_jsonl), samples).items():
+                if doc in self.classifications and self.classifications[doc] != record:
+                    raise ValueError("Imported classification conflicts with stored result")
+                if doc not in self.classifications:
+                    seeds[doc] = record
+            self.classifications.update(seeds)
         self.errors = store.load("errors.jsonl")
         for record in self.classifications.values():
             sample = samples[record["doc_name"]]
             if any(record.get(k) != v for k, v in sample.identity().items()) or record.get("judge_model") != config.judge_model:
                 raise ValueError("Stored classification identity/model mismatch")
-            labels = strict_json(record["raw_judge_response"])
+            labels, _ = parse_classification(record["raw_judge_response"], sample)
             validate_classification(labels, sample)
             if labels["classification_status"] != "completed" or any(record.get(k) != v for k, v in labels.items()):
                 raise ValueError("Stored classification differs from raw Judge labels")
@@ -191,6 +213,12 @@ class StatisticPipeline(Pipeline):
             if sample is None or any(record.get(k) != v for k, v in sample.identity().items()):
                 raise ValueError("Stored classification error identity mismatch")
         self.dataset = dataset
+        if seeds:
+            if file_hash(config.statistic_seed_jsonl) != snapshot["statistic_seed_sha256"]:
+                raise ValueError("Seed classifications changed during import")
+            for record in seeds.values():
+                store.append("classification_details.jsonl", record)
+            log.info("Imported %d validated classifications; only remaining samples will call Judge", len(seeds))
         self._record_input_errors(store)
         self.saved_count = len(self.classifications)
         self.attempted_docs = set(self.classifications) | {e["doc_name"] for e in self.errors if e.get("stage") == "classification"}

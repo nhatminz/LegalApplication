@@ -21,6 +21,7 @@ export API_MAX_RETRIES="${API_MAX_RETRIES:-3}"
 export JUDGE_JSON_RETRIES="${JUDGE_JSON_RETRIES:-2}"
 export RETRY_BACKOFF_SECONDS="${RETRY_BACKOFF_SECONDS:-2}"
 export RESUME="${RESUME:-0}"
+export STATISTIC_SEED_JSONL="${STATISTIC_SEED_JSONL:-}"
 export MODE=statistic  # Không kế thừa MODE=full/validate-only của application.
 
 cd "$PROJECT_ROOT"

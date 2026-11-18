@@ -12,6 +12,7 @@ import pytest
 from conftest import envelope, make_record
 from legal_application.completeness import COMPLETENESS_SCHEMA, completeness_messages, validate_classification
 from legal_application.data import DatasetError, parse_sample
+from legal_application.evidence import EVIDENCE_FORMAT, evidence_catalog, evidence_schema
 from legal_application.scoring import LabelError
 from legal_application.statistic import StatisticPipeline
 from legal_application.pipeline import Pipeline
@@ -48,6 +49,25 @@ def labels(raw, *, missing_issue=None, inferred=False):
             "issues_analysis": rows}
 
 
+def reference_labels(raw, value=None):
+    value = deepcopy(labels(raw) if value is None else value)
+    catalog = evidence_catalog(parse_sample(raw, 0))
+
+    def ids(source, quote):
+        start = raw["benchmark_seed"][source].index(quote)
+        end = start + len(quote)
+        return [key for key, span in catalog.items() if span["source"] == source and span["start"] < end and span["end"] > start]
+
+    value["evidence_format"] = EVIDENCE_FORMAT
+    for row in value["issues_analysis"]:
+        for fact in row["decisive_facts"]:
+            fact["reference_evidence"] = [{"source": ref["source"], "quote_id": key}
+                                          for ref in fact["reference_evidence"] for key in ids(ref["source"], ref["quote"])]
+            for field, source in [("facts_clean_evidence", "facts_clean"), ("raw_facts_evidence", "facts")]:
+                fact[field] = [key for quote in fact[field] for key in ids(source, quote)]
+    return value
+
+
 def run(config, handler):
     return asyncio.run(StatisticPipeline(config, judge_transport=httpx.MockTransport(handler)).run())
 
@@ -58,12 +78,12 @@ def handler_for(records, *, partial_docs=()):
     def handle(request):
         body = json.loads(request.content)
         assert body["chat_template_kwargs"] == {"thinking": True, "reasoning_effort": 75}
-        assert body["response_format"]["json_schema"]["schema"] == COMPLETENESS_SCHEMA
         payload = json.loads(body["messages"][1]["content"])
         raw = records[payload["doc_name"]]
+        assert body["response_format"]["json_schema"]["schema"] == evidence_schema(COMPLETENESS_SCHEMA, evidence_catalog(parse_sample(raw, 0)))
         assert payload["benchmark_seed"] == raw["benchmark_seed"]
         assert payload["issues"] == raw["issues"]
-        output = labels(raw, missing_issue=2 if raw["doc_name"] in partial_docs else None)
+        output = reference_labels(raw, labels(raw, missing_issue=2 if raw["doc_name"] in partial_docs else None))
         return httpx.Response(200, json=envelope(json.dumps(output, ensure_ascii=False)))
 
     return handle
@@ -362,7 +382,7 @@ def test_classification_export_feeds_application_filters_without_mutating_raw(co
     original = config.input_jsonl.read_bytes()
     run(config, handler_for(records, partial_docs={"partial-first"}))
     labelled = config.run_dir / "classified_input.jsonl"
-    app = replace(config, mode="full", run_id="application-full-only", input_jsonl=labelled, data_status_used="full_only")
+    app = replace(config, mode="full", run_id="application-full-only", input_jsonl=labelled)
     summary = asyncio.run(Pipeline(app, generator_transport=mock_transports[0], judge_transport=mock_transports[1]).run())
     assert summary["counts"]["completed"] == 1
     generation = read_jsonl(app.run_dir / "generations.jsonl")[0]

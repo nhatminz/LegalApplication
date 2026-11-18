@@ -39,6 +39,8 @@ INPUT_JSONL="$PROJECT_ROOT/input/judgment_with_issues_sample.jsonl" \
   JUDGE_THINKING_MODE=deepseek_vllm_xhigh bash scripts/statistic.sh
 ```
 
+Các lệnh resume/relocate dưới đây dùng khi code/prompt/schema còn khớp run gốc. Nếu cập nhật từ phiên bản cũ lên bản sửa retry hiện tại, dùng retry_statistic.sh để nhập các kết quả thành công vào run mới như bên dưới.
+
 Muốn ngắt để tăng batch/concurrency mà vẫn giữ kết quả statistic cũ: Ctrl-C và đợi process thoát, giữ RUN_ID đang chạy, rồi dùng helper. Ví dụ:
 
 ```bash
@@ -61,20 +63,42 @@ bash scripts/resume_statistic.sh 20261117T135710_be74ac50 \
 
 `--relocate` cập nhật project_root/output_dir trong config đã sao lưu. Input nằm trong project cũ được đổi sang vị trí tương ứng trong project mới; input bên ngoài, như `/workspace/storage-shared/nlp/minhpn19/LegalDataset/output/2k_clean_hoi_final/judgment_with_issues.jsonl`, giữ nguyên path. Nếu input cũng được di chuyển riêng, thêm `--input-jsonl /duong/dan/moi/input.jsonl`; checksum phải khớp tuyệt đối run cũ. Helper chỉ chấp nhận thay đổi implementation hash khi xác minh code chỉ khác đúng giá trị path mặc định trong Config; các thay đổi code/prompt/schema khác vẫn bị từ chối. Cấu hình và nhãn Judge cũ được giữ để đối chiếu trong backup/audit.
 
-Application bây giờ **bắt buộc data_status=full/partial trên mọi record**, kể cả với DATA_STATUS_USED=all và ngoài LIMIT. Thiếu/sai nhãn làm validation thất bại rõ ràng, không đoán hoặc tự xóa record vì lỗi nhãn. Dùng classified_input.jsonl hoàn chỉnh từ statistic:
+Application luôn chỉ chọn samples **full**, lọc trước LIMIT; không còn tùy chọn DATA_STATUS_USED. Có thể đọc file có nhãn full/partial của statistic (partial tự bị bỏ qua), hoặc dùng script dưới để xuất input giữ nguyên cấu trúc và bytes nguồn, kể cả khi run statistic còn sample failed:
 
 ```bash
-export INPUT_JSONL="$OUTPUT_DIR/$STAT_RUN_ID/classified_input.jsonl"
+export PROJECT_ROOT=/workspace/storage-shared/nlp/users/minhpn19/LegalApplication
+cd "$PROJECT_ROOT"
+bash scripts/filter_full.sh \
+  --input /workspace/storage-shared/nlp/users/minhpn19/LegalDataset/output/2k_clean_hoi_final/judgment_with_issues.jsonl \
+  --classifications "$PROJECT_ROOT/outputs/20261117T202530_5e87eebe/classification_details.jsonl" \
+  --output "$PROJECT_ROOT/input/input_application_clean_v1.jsonl"
 
-# Giả định generator endpoint/model đã được cấu hình như phần dưới.
-MODE=full DATA_STATUS_USED=full_only LIMIT=100 RESUME=0 \
-  RUN_ID="application-full-only-${RANDOM}" bash scripts/run_application.sh
-
-MODE=full DATA_STATUS_USED=all LIMIT=all RESUME=0 \
-  RUN_ID="application-all-${RANDOM}" bash scripts/run_application.sh
+INPUT_JSONL="$PROJECT_ROOT/input/input_application_clean_v1.jsonl" \
+  MODE=full LIMIT=all RESUME=0 RUN_ID="application-full-${RANDOM}" \
+  bash scripts/run_application.sh
 ```
 
-`full_only` lọc full **trước LIMIT**, giữ nguyên thứ tự, chỉ số dòng và sample hash của file có nhãn; không xóa partial khỏi input. `all` nhận cả hai nhãn hợp lệ. Cả full/judge-only/validate-only và resume dùng cùng filter. `data_status_counts` trong summary báo số input full/partial, filtered_out, eligible, selected và completed của từng nhóm. DATA_STATUS_USED nằm trong snapshot; đổi filter cần RUN_ID mới.
+Script nối bằng document_id nếu có; artifact cũ dùng doc_name được nối theo doc_name. Khi cả hai có mặt phải nhất quán; sample_sha256 được kiểm tra nếu artifact có lưu. Chỉ nhãn completed/full được xuất, theo thứ tự nguồn; không thêm data_status hoặc serialize lại JSON. File input_application_clean_v1.jsonl.manifest.json ghi checksum và danh sách full để Application xác minh input gốc không có nhãn. Giữ manifest cạnh output; không sửa nội dung file sau khi lọc. Dòng nguồn JSON/schema lỗi được bỏ qua, báo vào input_application_clean_v1.jsonl.filter_log.jsonl. File nguồn và classification_details không bị sửa. Có thể lặp --classifications để kết hợp nhiều run; nhãn xung đột bị từ chối.
+
+Record lỗi đã cung cấp có finish_reason=stop ở cả ba lần, nhưng validation_errors báo quote không khớp facts_clean/application: đó là lỗi sao chép evidence, không phải trường hợp bị cắt output. Không suy ra mọi sample failed đều cùng nguyên nhân nếu chưa thống kê.
+
+Statistic dùng evidence_format=source_ids_v1 cho request mới: toàn bộ nguồn vẫn được gửi, kèm catalog chia thành các đoạn liên tục có ID. Judge chọn quote_id cho application/conclusion và các ID trong facts_clean_evidence/raw_facts_evidence; JSON Schema giới hạn các lựa chọn vào ID đã có. Python tra ID, kiểm tra đúng trường nguồn và lấy nguyên văn đoạn gốc để ghi quote trong classification_details. Không bắt model chép lại văn bản nguồn, không fuzzy matching và không tự đổi nhãn để vượt validation. ID không tồn tại/dùng nhầm nguồn vẫn là lỗi. Catalog bao phủ toàn bộ nguồn; 500 ký tự là kích thước mỗi đoạn, không phải giới hạn/cắt input.
+
+raw_judge_response giữ nguyên JSON chứa IDs; metadata.normalizations ghi các ID và vị trí start/end đã mở rộng. Artifact ngoài vẫn có cấu trúc evidence.quote và các đoạn trích như trước; seed/resume kiểm chứng lại được cả giao thức ID mới và quote cũ. Với quote cũ chỉ có thể sửa JSON fence/khoảng trắng rồi validate nguyên văn. Retry giữ response trước đó và vị trí field lỗi. errors.jsonl lưu last_validation_error, invalid_responses và usage/finish_reason; summary có failure_reasons. Không tự thay đổi thinking hoặc tăng token budget.
+
+Sau khi cập nhật code này, dùng **run mới có nhập kết quả cũ** để tránh xung đột implementation hash. Run cũ giữ nguyên, các nhãn thành công được kiểm tra lại identity/hash/schema/evidence/model trước khi tái sử dụng:
+
+```bash
+export OUTPUT_DIR="$PROJECT_ROOT/outputs"
+export RETRY_RUN_ID="retry-$(TZ=Asia/Ho_Chi_Minh date +%Y%m%d-%H%M%S)-${RANDOM}"
+bash scripts/retry_statistic.sh 20261117T202530_5e87eebe \
+  --run-id "$RETRY_RUN_ID" \
+  --input-jsonl /workspace/storage-shared/nlp/users/minhpn19/LegalDataset/output/2k_clean_hoi_final/judgment_with_issues.jsonl \
+  --batch-size 200 --judge-concurrency 200 \
+  --judge-json-retries 4 --max-output-tokens 65536
+```
+
+Với log đã nêu, 810 kết quả cũ được nhập, chỉ 1.199 samples còn thiếu được gọi Judge. --judge-json-retries 4 nghĩa tối đa 5 lần trả structured output cho mỗi sample. Input phải giữ đúng checksum của run cũ, kể cả khi path đã đổi. Judge/thinking/LIMIT/timeout được khôi phục từ config cũ; có thể chỉ định --judge-thinking-mode nếu muốn đổi rõ ràng cho các request mới. Seed và thống kê nguyên nhân lỗi cũ nằm ở outputs/.statistic-seeds/$RETRY_RUN_ID/source.json. Lọc lại bằng --classifications "$OUTPUT_DIR/$RETRY_RUN_ID/classification_details.jsonl" để lấy cả full cũ và full mới. Resume run mới bằng scripts/resume_statistic.sh "$RETRY_RUN_ID"; helper resume không bỏ qua thay đổi code/prompt/schema của run cũ.
 
 ## Cài đặt trên B200
 
@@ -105,7 +129,7 @@ Mỗi dòng JSONL phải là một object với:
 | `laws` | Danh sách luật không rỗng; mỗi luật có `law_str` |
 | `laws[].provisions[]` | Nếu có provisions: bắt buộc `citation_str` và `law_content.context_text` không rỗng cho từng provision |
 | `laws[].law_content` | Khi không có provisions: dùng `context_text` nếu khác null; nếu thiếu/null thì dùng `exact_text`. Nội dung được chọn phải là chuỗi không rỗng |
-| `data_status` | Bắt buộc full/partial với Application; statistic đọc input gốc chưa có trường này |
+| `data_status` | Nếu có phải là full/partial; Application chỉ chọn full. Input raw không có nhãn cần manifest từ filter_full.sh |
 
 Fallback chỉ áp dụng ở **cấp luật khi không có provisions**; không tự thay context_text của provision bằng exact_text. Nguồn fallback được ghi trong prompt, `metadata.law_sources` của generation và run.log. Không chọn lọc luật theo mức liên quan, không cắt ngắn hoặc chuẩn hóa lại nội dung. Generator dùng projection allowlist, không nhận application, conclusion, markdown, explain hoặc metadata của luật chứa nguồn đáp án. Judge nhận toàn bộ benchmark_seed, issues, luật gốc và nguyên văn message.content của generator.
 
@@ -122,21 +146,10 @@ MODE=validate-only RUN_ID=schema-check \
   bash "$PROJECT_ROOT/scripts/run_application.sh"
 ```
 
-Tệp mẫu gốc trong repository có 6 records hợp lệ nhưng chưa có data_status; cần phân loại bằng statistic trước. Bản raw có JSON/schema lỗi sẽ được statistic báo cáo, bỏ qua và giữ nguyên nguồn; Application vẫn có cleanup như mô tả trên sau khi input có nhãn hợp lệ. Xem `counts.input_invalid` của statistic để biết số dòng nguồn bị bỏ qua; `counts.input_removed` của Application là số dòng bị xóa ở cơ chế cleanup riêng. Để smoke test riêng 1–5 bản án, có thể tạo một tệp con chứa 5 dòng đầu của INPUT_JSONL đã gắn nhãn:
+Tệp mẫu gốc trong repository có 6 records hợp lệ nhưng chưa có data_status; cần phân loại bằng statistic trước. Bản raw có JSON/schema lỗi sẽ được statistic báo cáo, bỏ qua và giữ nguyên nguồn; Application vẫn có cleanup như mô tả trên sau khi input có nhãn hợp lệ. Xem `counts.input_invalid` của statistic để biết số dòng nguồn bị bỏ qua; `counts.input_removed` của Application là số dòng bị xóa ở cơ chế cleanup riêng. Để smoke test 5 bản án, giữ nguyên file đã lọc cùng manifest và dùng LIMIT=5; không cắt file bằng head vì sẽ làm lệch checksum:
 
 ```bash
-python - <<'PY'
-import os
-from itertools import islice
-from pathlib import Path
-root = Path(os.environ['PROJECT_ROOT'])
-with Path(os.environ['INPUT_JSONL']).open('rb') as source:
-    lines = list(islice(source, 5))
-with (root / 'input/smoke_5.jsonl').open('xb') as target:
-    target.writelines(lines)
-PY
-
-MODE=validate-only INPUT_JSONL=input/smoke_5.jsonl RUN_ID=smoke-schema \
+MODE=validate-only LIMIT=5 INPUT_JSONL=input/input_application_clean_v1.jsonl RUN_ID=smoke-schema \
   bash "$PROJECT_ROOT/scripts/run_application.sh"
 ```
 
@@ -310,7 +323,7 @@ Mỗi `OUTPUT_DIR/RUN_ID/` có:
 
 Các artifacts thành công không có record giả thay thế cho lỗi. Muốn đối chiếu toàn selected set, đọc thêm summary và errors.jsonl. Output có thể về khác thứ tự input do concurrency; join bằng **doc_name + input_index**, kèm sample checksum. Không zip theo vị trí dòng.
 
-`counts.input` là tổng số dòng hợp lệ còn lại cộng số dòng đã xóa trong run; `input_valid` là số records validate được sau cleanup; `input_removed` là số dòng JSON lỗi đã xóa (giữ lịch sử khi resume). `selected` là min(LIMIT, input_valid), hoặc toàn bộ records hợp lệ khi LIMIT rỗng/all. Dòng đã xóa không bị tính thành sample failed hay điểm 0. `attempted` là số identity đã xử lý qua API hoặc được import/đã có lịch sử xử lý trong run; `completed` là số evaluations hợp lệ, gồm review; `failed` là số sample còn lỗi chưa khắc phục; `skipped` là số evaluations terminal có sẵn đầu invocation hiện tại; `scored` chỉ tính evaluations không review. `generation`/`evaluation` có số cumulative completed/failed/pending và `this_invocation` ghi attempted/completed/failed/skipped theo từng stage. Trong judge-only, import là generation skipped, không phải generator API attempted. Lỗi cũ được giữ trong errors.jsonl nhưng không tiếp tục tính failed khi sample đã hoàn thành.
+`counts.input` là tổng số dòng hợp lệ còn lại cộng số dòng đã xóa trong run; `input_valid` là số records validate được sau cleanup; `input_removed` là số dòng JSON lỗi đã xóa (giữ lịch sử khi resume). `selected` là min(LIMIT, số records full hợp lệ), hoặc toàn bộ records full khi LIMIT rỗng/all. Dòng đã xóa không bị tính thành sample failed hay điểm 0. `attempted` là số identity đã xử lý qua API hoặc được import/đã có lịch sử xử lý trong run; `completed` là số evaluations hợp lệ, gồm review; `failed` là số sample còn lỗi chưa khắc phục; `skipped` là số evaluations terminal có sẵn đầu invocation hiện tại; `scored` chỉ tính evaluations không review. `generation`/`evaluation` có số cumulative completed/failed/pending và `this_invocation` ghi attempted/completed/failed/skipped theo từng stage. Trong judge-only, import là generation skipped, không phải generator API attempted. Lỗi cũ được giữ trong errors.jsonl nhưng không tiếp tục tính failed khi sample đã hoàn thành.
 
 Summary được ghi atomic sau mỗi batch và khi dừng có kiểm soát. Nếu bị kill cứng giữa batch, JSONL đã commit là nguồn chính xác để resume và tính lại summary. Cleanup loại record JSON/schema lỗi; nếu không còn record hoặc input thay đổi ngoài tiến trình trong lúc kiểm tra, preflight vẫn dừng rõ ràng trước mọi request.
 
@@ -325,7 +338,7 @@ Mọi biến dưới đây có thể export hoặc sửa mặc định ở đầ
 | Biến | Mặc định / ý nghĩa |
 |---|---|
 | `PROJECT_ROOT` | `/workspace/storage-shared/nlp/users/minhpn19/LegalApplication` |
-| `INPUT_JSONL` | `$PROJECT_ROOT/input/judgment_with_issues_sample.jsonl` |
+| `INPUT_JSONL` | Application: `$PROJECT_ROOT/input/input_application_clean_v1.jsonl`; statistic: input raw |
 | `GENERATOR_BASE_URL`, `GENERATOR_MODEL` | Script điền sẵn `http://127.0.0.1:8001/v1`, `Qwen/Qwen3-4B`; sửa ở đầu script hoặc export để đổi model/server. Python CLI trực tiếp vẫn yêu cầu cấu hình rõ |
 | `JUDGE_BASE_URL` | `http://172.29.62.173:8000/v1` |
 | `JUDGE_MODEL` | `DeepSeek-V4.1-Flash-1017` |
@@ -336,7 +349,6 @@ Mọi biến dưới đây có thể export hoặc sửa mặc định ở đầ
 | `OUTPUT_DIR` | `$PROJECT_ROOT/outputs` |
 | `RUN_ID` | Timestamp giờ Việt Nam + hậu tố ngẫu nhiên nếu không đặt |
 | `MODE` | full / judge-only / validate-only |
-| `DATA_STATUS_USED` | all (mặc định) / full_only; cả hai đều yêu cầu nhãn hợp lệ, lọc trước LIMIT |
 | `GENERATION_JSONL` | Path nguồn generation, bắt buộc ở judge-only |
 | `RESUME` | 0; đặt 1 để tiếp tục run đã có |
 | `API_TIMEOUT_SECONDS` | 1800 cho mỗi HTTP request |

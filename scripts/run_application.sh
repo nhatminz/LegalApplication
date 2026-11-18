@@ -20,13 +20,13 @@ export GENERATOR_THINKING_MODE="${GENERATOR_THINKING_MODE:-none}"
 # Runtime paths are based on PROJECT_ROOT. Relative path exports also resolve from it.
 export PROJECT_ROOT="${PROJECT_ROOT:-/workspace/storage-shared/nlp/users/minhpn19/LegalApplication}"
 # Record JSON/schema lỗi (kể cả issues rỗng) được ghi log rồi xóa khỏi INPUT_JSONL.
-export INPUT_JSONL="${INPUT_JSONL:-${PROJECT_ROOT}/input/judgment_with_issues_sample.jsonl}"
+export INPUT_JSONL="${INPUT_JSONL:-${PROJECT_ROOT}/input/input_application_clean_v1.jsonl}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs}"
 export RUN_ID="${RUN_ID:-}"  # Empty -> Vietnam local timestamp + random suffix.
 export MODE="${MODE:-full}"  # full | judge-only | validate-only
 export GENERATION_JSONL="${GENERATION_JSONL:-}"
 export RESUME="${RESUME:-0}"
-export DATA_STATUS_USED="${DATA_STATUS_USED:-all}"  # all | full_only; input phải có data_status.
+# Application luôn chỉ chọn full; file gốc không có nhãn cần manifest từ filter_full.sh.
 
 # MODEL JUDGE: chấm bài làm của generator, mặc định DeepSeek với effort xhigh.
 export JUDGE_BASE_URL="${JUDGE_BASE_URL:-http://172.29.62.173:8000/v1}"
