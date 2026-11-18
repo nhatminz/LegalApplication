@@ -100,6 +100,21 @@ bash scripts/retry_statistic.sh 20261117T202530_5e87eebe \
 
 Với log đã nêu, 810 kết quả cũ được nhập, chỉ 1.199 samples còn thiếu được gọi Judge. --judge-json-retries 4 nghĩa tối đa 5 lần trả structured output cho mỗi sample. Input phải giữ đúng checksum của run cũ, kể cả khi path đã đổi. Judge/thinking/LIMIT/timeout được khôi phục từ config cũ; có thể chỉ định --judge-thinking-mode nếu muốn đổi rõ ràng cho các request mới. Seed và thống kê nguyên nhân lỗi cũ nằm ở outputs/.statistic-seeds/$RETRY_RUN_ID/source.json. Lọc lại bằng --classifications "$OUTPUT_DIR/$RETRY_RUN_ID/classification_details.jsonl" để lấy cả full cũ và full mới. Resume run mới bằng scripts/resume_statistic.sh "$RETRY_RUN_ID"; helper resume không bỏ qua thay đổi code/prompt/schema của run cũ.
 
+## Xuất input riêng cho ba tác vụ
+
+Từ file full input_application_clean_v2.jsonl, tạo ba file có hai trường input/expected_answer cho issue spotting, application và conclusion:
+
+```bash
+export PROJECT_ROOT=/workspace/storage-shared/nlp/users/minhpn19/LegalApplication
+cd "$PROJECT_ROOT"
+bash scripts/create_task_inputs.sh \
+  --input "$PROJECT_ROOT/input/input_application_clean_v2.jsonl" \
+  --output-dir "$PROJECT_ROOT/input/input_temp_18_11" \
+  --expected-count 1207
+```
+
+Output là input_issue_spotting.jsonl, input_application.jsonl, input_conclusion.jsonl, mỗi file 1.207 dòng theo cùng thứ tự nguồn. Cả ba dùng benchmark_seed.facts_clean. input của Application là object {facts_clean, issues, rules}; Conclusion có thêm benchmark_seed.application. Expected answer lần lượt là issues (list), benchmark_seed.application (string), benchmark_seed.conclusion (string). Mỗi rule chứa law_str/citation_str/context_text theo cùng quy tắc lấy luật và fallback của run_application. manifest.json lưu checksum và mapping số dòng sang định danh. Script không gọi API hoặc sửa input; validation/count thất bại không thay các output cũ. Các file hai trường là dataset riêng cho từng tác vụ; pipeline run_application vẫn đọc schema bản án gốc. Chi tiết cấu trúc và lệnh chạy ở mục 1.5 của [HUONG_DAN_CHAY.md](HUONG_DAN_CHAY.md).
+
 ## Cài đặt trên B200
 
 Client cần Python **>=3.10**, không cần GPU hay PyTorch. Dùng môi trường `.venv` hiện có của bạn, đặt ở bất kỳ thư mục nào. Script gọi `python` trên PATH sau khi activate môi trường; không kiểm tra phiên bản thư viện hoặc yêu cầu `.venv` trong project. Server vLLM được triển khai riêng.

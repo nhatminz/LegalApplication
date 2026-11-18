@@ -238,6 +238,57 @@ Sau khi cập nhật bản sửa giao thức evidence, dùng retry_statistic.sh 
 
 Nếu phần lớn lỗi là finish_reason=length hoặc final content rỗng, cần xem token usage và cấu hình reasoning parser/context của server; prompt/retry phía client không bảo đảm khắc phục hết giới hạn server. [Tài liệu vLLM về reasoning](https://docs.vllm.ai/en/stable/features/reasoning_outputs/) và [structured outputs](https://docs.vllm.ai/en/stable/features/structured_outputs/) mô tả việc tách reasoning/final và hỗ trợ theo backend. Nếu còn lỗi schema/evidence thì response vẫn bị từ chối, không chuyển thành full để tăng số dữ liệu giả.
 
+### 1.5. Tạo ba input độc lập cho issue spotting, application và conclusion
+
+Nguồn là input/input_application_clean_v2.jsonl gồm 1.207 records full do bạn tạo. Script chuyển dữ liệu không gọi API, không cần GPU, giữ nguyên nguồn và không đổi code/hash của package pipeline. Chạy trong môi trường Python đã activate:
+
+```bash
+export PROJECT_ROOT=/workspace/storage-shared/nlp/users/minhpn19/LegalApplication
+cd "$PROJECT_ROOT"
+
+bash scripts/create_task_inputs.sh \
+  --input "$PROJECT_ROOT/input/input_application_clean_v2.jsonl" \
+  --output-dir "$PROJECT_ROOT/input/input_temp_18_11" \
+  --expected-count 1207
+```
+
+Ba output có cùng số dòng, cùng thứ tự nguồn, mỗi dòng chỉ có input và expected_answer:
+
+| File trong input/input_temp_18_11 | input | expected_answer |
+|---|---|---|
+| input_issue_spotting.jsonl | Chuỗi benchmark_seed.facts_clean nguyên văn | Danh sách issues nguyên gốc |
+| input_application.jsonl | Object gồm facts_clean, issues, rules | Chuỗi benchmark_seed.application nguyên văn |
+| input_conclusion.jsonl | Object gồm facts_clean, issues, rules, application | Chuỗi benchmark_seed.conclusion nguyên văn |
+
+Facts của cả ba tác vụ đều dùng facts_clean. Trường application trong input_conclusion là benchmark_seed.application, không phải output của model. Đây là các bộ dữ liệu độc lập; kết quả issue spotting/application không được ghép tự động sang tác vụ sau.
+
+Ví dụ cấu trúc một dòng Application (giá trị chỉ minh họa):
+
+```json
+{
+  "input": {
+    "facts_clean": "Các tình tiết đã được làm sạch.",
+    "issues": ["Vấn đề pháp lý thứ nhất?"],
+    "rules": [
+      {
+        "law_str": "Tên văn bản luật",
+        "citation_str": "Điều 1",
+        "context_text": "Nguyên văn nội dung điều khoản."
+      }
+    ]
+  },
+  "expected_answer": "Nội dung benchmark_seed.application."
+}
+```
+
+rules được trải phẳng theo thứ tự gốc: mỗi provision là một object gồm law_str, citation_str và context_text. Nội dung lấy từ laws[].provisions[].law_content.context_text; không đưa các metadata luật khác vào input. Khi luật không có provisions, lấy laws[].law_content.context_text, hoặc exact_text nếu context_text thiếu/null; citation_str lúc này là null. Quy tắc khớp run_application, không cắt ngắn, lọc bớt hoặc viết lại nội dung luật.
+
+manifest.json trong cùng thư mục lưu checksum nguồn/output, số records và ánh xạ số dòng sang doc_name/document_id. Nó giúp đối chiếu ba file mà không thêm field vào từng sample. --expected-count chỉ kiểm tra số lượng, không giới hạn dữ liệu. Không có hidden cap; muốn dùng nguồn khác thì đổi --input và --expected-count tương ứng, hoặc bỏ --expected-count. TASK_SOURCE_JSONL/TASK_INPUT_DIR là hai biến tùy chọn cho script; không kế thừa INPUT_JSONL/OUTPUT_DIR của các run benchmark trước.
+
+Script dừng khi gặp JSON/schema lỗi, doc_name trùng, nhãn data_status có mặt nhưng khác full, hoặc số samples khác expected-count. Nó không tự bỏ dòng và không ghi đè ba output cũ khi validation thất bại; file nguồn không bị sửa. Nguồn full từ filter_full không có data_status vẫn được chấp nhận. Chạy lại thành công sẽ thay ba output và manifest bằng dữ liệu mới.
+
+Các file hai trường này phục vụ từng tác vụ riêng. run_application hiện tại đọc schema bản án gốc, nên vẫn dùng input_application_clean_v2.jsonl khi chạy pipeline benchmark hiện có.
+
 ## 2. Terminal 1: host checkpoint Qwen3-4B
 
 Ví dụ dùng GPU số 0, port 8001, tên model trên API là `Qwen/Qwen3-4B`.
