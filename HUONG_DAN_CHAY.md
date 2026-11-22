@@ -35,7 +35,15 @@ EVALUATION_PROFILE=rubric INPUT_JSONL="$FINAL_APPLICATION_JSONL" \
   RESUME=0 bash scripts/run_application.sh
 ```
 
-Script kiểm tra toàn bộ file nguồn, kể cả các dòng ngoài `LIMIT`. Nếu `LIMIT` nhỏ hơn tổng số dòng, kết quả đủ của tập con được ghi dưới run directory với hậu tố `_subset.jsonl`. Hai file final cùng manifest chỉ được xuất với đủ số mẫu yêu cầu và rubric của mọi mẫu đã qua kiểm định. Script từ chối ghi đè nếu một file đích đã tồn tại với nội dung khác. Khi xuất thành công, manifest nằm cạnh Application với hậu tố `.manifest.json`, có checksum của cả hai file và đối chiếu `doc_name` theo dòng gốc. Để đánh giá một phiên bản đã xuất, dùng file Application và manifest đi cùng.
+Script kiểm tra toàn bộ file nguồn, kể cả các dòng ngoài `LIMIT`. Với `LIMIT` lớn hơn 0 và nhỏ hơn tổng số dòng, kết quả đủ của tập con được ghi dưới run directory với hậu tố `_subset.jsonl`. Hai file final cùng manifest chỉ được xuất với đủ số mẫu yêu cầu và rubric của mọi mẫu đã qua kiểm định. Script từ chối ghi đè nếu một file đích đã tồn tại với nội dung khác. Khi xuất thành công, manifest nằm cạnh Application với hậu tố `.manifest.json`, có checksum của cả hai file và đối chiếu `doc_name` theo dòng gốc. Để đánh giá một phiên bản đã xuất, dùng file Application và manifest đi cùng.
+
+Dùng `LIMIT=0` để kiểm tra riêng dữ liệu raw trước khi gọi API.
+
+```bash
+EXPECTED_COUNT=600 LIMIT=0 RUN_ID=raw-rubric-preflight RESUME=0 bash scripts/generate_rubrics.sh
+```
+
+Khi input hợp lệ, kết quả có `status=input_validated` và `counts.valid=600`. Chi tiết lỗi theo dòng và thống kê theo nguyên nhân nằm trong `rubric_generation_summary.json`. Nhãn `Commercial` dùng taxonomy riêng cho án kinh doanh thương mại. Nếu run cũ dừng ngay ở validation, chọn RUN_ID mới cho lần sinh tiếp theo vì run cũ chưa có snapshot để resume.
 
 ### Chạy đánh giá
 

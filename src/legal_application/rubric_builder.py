@@ -191,8 +191,14 @@ class RubricPipeline(Pipeline):
         try:
             dataset = read_dataset(config.input_jsonl, config.limit, parser=raw_rubric_sample)
         except DatasetError as exc:
+            reasons = Counter(e["error"] for e in exc.errors)
+            report_path = store.path / "rubric_generation_summary.json"
+            for reason, count in reasons.most_common(10):
+                log.error("Raw rubric validation: %d row(s): %s", count, reason)
+            log.error("Full validation report: %s", report_path)
             summary = {"run_id": config.run_id, "status": "input_validation_failed", "published": False,
                        "counts": {"input": exc.input_count, "valid": exc.valid_count, "invalid": len(exc.errors), "failed": len(exc.errors)},
+                       "invalid_by_reason": dict(reasons),
                        "invalid_by_category": dict(Counter(e.get("category", "unknown") for e in exc.errors)),
                        "input_validation_errors": exc.errors}
             self.write_summary(store, summary)
@@ -204,6 +210,13 @@ class RubricPipeline(Pipeline):
                        "expected_count": config.expected_count, "counts": {"input": dataset.input_count, "failed": 0}}
             self.write_summary(store, summary)
             raise ValueError(f"EXPECTED_COUNT={config.expected_count}, found {dataset.input_count} raw samples")
+        if config.limit == 0:
+            summary = {"run_id": config.run_id, "status": "input_validated", "published": False,
+                       "counts": {"input": dataset.input_count, "valid": dataset.valid_count,
+                                  "invalid": 0, "selected": 0, "failed": 0},
+                       "input_sha256": dataset.sha256}
+            self.write_summary(store, summary)
+            return summary
         snapshot = {**config.snapshot(), "pipeline_kind": "rubric_generation", "artifact_version": 1,
                     "input_sha256": dataset.sha256, "implementation_sha256": implementation_hash(),
                     "rubric_thinking": resolve_thinking(config.rubric_thinking_mode)}

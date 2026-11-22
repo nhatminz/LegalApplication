@@ -20,6 +20,17 @@ TAXONOMY = {
         "disposition": "Căn cứ pháp luật, chấp nhận hoặc bác yêu cầu và hậu quả pháp lý",
         "fees_appeal": "Án phí, chi phí tố tụng và kháng cáo",
     },
+    "Commercial": {
+        "relationship": "Quan hệ kinh doanh, thương mại và tư cách của các bên",
+        "procedure": "Thẩm quyền, thủ tục và điều kiện giải quyết tranh chấp",
+        "claims": "Yêu cầu khởi kiện, phản tố và yêu cầu độc lập",
+        "evidence": "Chứng cứ, giao dịch và tình tiết được Tòa xác định",
+        "contract": "Giao kết, hiệu lực và nội dung của giao dịch thương mại",
+        "obligations": "Thực hiện, vi phạm nghĩa vụ và căn cứ miễn trách nhiệm",
+        "remedies": "Thanh toán, lãi, phạt vi phạm, bồi thường và hậu quả pháp lý",
+        "disposition": "Căn cứ chấp nhận hoặc bác yêu cầu",
+        "fees_appeal": "Án phí, chi phí tố tụng và kháng cáo",
+    },
     "Marriage & Family": {
         "relationship": "Quan hệ hôn nhân gia đình và tính hợp pháp của hôn nhân",
         "marriage": "Căn cứ giải quyết yêu cầu về hôn nhân",
@@ -53,6 +64,7 @@ TAXONOMY = {
 CATEGORY_ALIASES = {
     **{name.casefold(): name for name in TAXONOMY},
     "hình sự": "Criminal", "dân sự": "Civil",
+    "kinh doanh thương mại": "Commercial", "kinh doanh, thương mại": "Commercial",
     "marriage and family": "Marriage & Family", "hôn nhân và gia đình": "Marriage & Family",
     "hngđ": "Marriage & Family", "labour": "Labor", "lao động": "Labor", "hành chính": "Administrative",
 }

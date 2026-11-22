@@ -128,7 +128,8 @@ def test_rubric_validation_rejects_inconsistent_source_and_mapping(change):
 
 
 def test_build_retry_resume_paired_publish_and_evaluate(config_factory, tmp_path):
-    originals = [raw_record("first"), raw_record("second", "Criminal")]
+    originals = [raw_record("first"), raw_record("second", "Commercial")]
+    originals[1]["code"] = "KDTM-ST"
     application = tmp_path / "final/application.jsonl"
     spotting = tmp_path / "final/spotting.jsonl"
     config = config_factory(originals, mode="build-rubrics", expected_count=2, rubric_json_retries=0,
@@ -187,7 +188,7 @@ def test_build_retry_resume_paired_publish_and_evaluate(config_factory, tmp_path
         assert "tự chọn bố cục" in body["messages"][0]["content"]
         prompt = body["messages"][1]["content"]
         assert {"response_format", "rubrics", "category", "doc_name", "expected_answer"}.isdisjoint(body)
-        assert all(secret not in prompt for secret in [ANSWER, "Criminal", "Civil", "first", "second", "I1_C1"])
+        assert all(secret not in prompt for secret in [ANSWER, "Commercial", "Civil", "first", "second", "I1_C1"])
         accessed.append("generator")
         return httpx.Response(200, json=envelope(WORDS))
 
@@ -209,7 +210,7 @@ def test_build_retry_resume_paired_publish_and_evaluate(config_factory, tmp_path
     summary = run_eval(evaluation, generate, judge)
     assert accessed.count("generator") == accessed.count("judge") == 2
     assert summary["application_score"] == 1 and summary["outcome_accuracy"] == 0
-    assert summary["by_category"]["Criminal"]["unscorable_samples"] == 1
+    assert summary["by_category"]["Commercial"]["unscorable_samples"] == 1
     assert summary["by_category"]["Civil"]["application_scored_samples"] == 1
     assert "final_order" not in json.dumps(summary)
     generations = read_jsonl(evaluation.run_dir / "generations.jsonl")
