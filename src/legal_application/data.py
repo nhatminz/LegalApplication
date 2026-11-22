@@ -126,7 +126,8 @@ class Dataset:
 
 
 def read_dataset(path: Path, limit: int | None, *, application: bool = False, verified_full: bool = False,
-                 skip_invalid: bool = False, on_invalid: Callable[[dict, bytes], None] | None = None) -> Dataset:
+                 skip_invalid: bool = False, on_invalid: Callable[[dict, bytes], None] | None = None,
+                 parser: Callable[[object, int], Sample] = parse_sample) -> Dataset:
     """Validate every line, including those beyond LIMIT; retain only selected samples."""
     selected, errors, seen = [], [], set()
     count = valid = 0
@@ -143,7 +144,7 @@ def read_dataset(path: Path, limit: int | None, *, application: bool = False, ve
             try:
                 raw = strict_json(line.decode("utf-8"))
                 validation_stage = "schema"
-                sample = parse_sample(raw, index)
+                sample = parser(raw, index)
                 if sample.doc_name in seen:
                     validation_stage = "duplicate_doc_name"
                     raise ValueError(f"duplicate doc_name {sample.doc_name!r}")
@@ -167,6 +168,8 @@ def read_dataset(path: Path, limit: int | None, *, application: bool = False, ve
                 error = {"input_index": index, "input_line": index + 1, "error": str(exc),
                          "validation_stage": validation_stage, "error_type": type(exc).__name__,
                          "doc_name": raw.get("doc_name") if isinstance(raw, dict) and isinstance(raw.get("doc_name"), str) else None}
+                if isinstance(raw, dict) and isinstance(raw.get("category"), str):
+                    error["category"] = raw["category"]
                 errors.append(error)
                 if on_invalid is not None:
                     on_invalid(error, line)
@@ -178,3 +181,9 @@ def read_dataset(path: Path, limit: int | None, *, application: bool = False, ve
         raise DatasetError(errors, count, valid)
     return Dataset(selected, count, digest.hexdigest(), status_counts, eligible, filtered_out, valid, errors)
 
+
+
+def rule_inputs(sample: Sample) -> list[dict]:
+    """Project the same complete rules and fallbacks used by the generator."""
+    return [{"law_str": block["law_str"], "citation_str": block["citation_str"], "context_text": block["content"]}
+            for block in sample.law_blocks]

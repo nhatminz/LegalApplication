@@ -42,12 +42,12 @@ class APIClient:
 
     def body(self, messages: list[dict], *, schema: dict | None = None) -> dict:
         result = {"model": self.model, "messages": messages, "stream": False,
-                  "max_tokens": self.config.max_output_tokens}
+                  "max_tokens": self.config.rubric_max_output_tokens if self.role == "rubric" else self.config.max_output_tokens}
         result.update(thinking_parameters(getattr(self.config, f"{self.role}_thinking_mode")))
-        if self.role == "judge":
+        if self.role in {"judge", "rubric"}:
             result["response_format"] = (
                 {"type": "json_schema", "json_schema": {"name": "legal_application_labels", "strict": True, "schema": LABEL_SCHEMA if schema is None else schema}}
-                if self.config.judge_response_format == "json_schema" else {"type": "json_object"}
+                if getattr(self.config, f"{self.role}_response_format") == "json_schema" else {"type": "json_object"}
             )
         return result
 
@@ -72,7 +72,7 @@ class APIClient:
                         pass
                     raise httpx.HTTPStatusError("retryable HTTP status", request=response.request, response=response)
                 if response.is_error:
-                    suffix = " (check json_schema/reasoning-parser support; no automatic format fallback)" if self.role == "judge" and status == 400 else ""
+                    suffix = " (check json_schema/reasoning-parser support; no automatic format fallback)" if self.role in {"judge", "rubric"} and status == 400 else ""
                     raise APIError(f"{self.role} HTTP {status}{suffix}", {"request_id": request_id, "attempts": attempts})
                 data = response.json()
                 choice = data["choices"][0]

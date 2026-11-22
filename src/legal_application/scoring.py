@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from importlib.resources import files
+from statistics import mean
 
 from jsonschema import Draft202012Validator
 
 from .data import Sample
+from .rubrics import criteria_for, issue_blocked, load_schema, require_schema
 
 LABEL_SCHEMA = json.loads(files("legal_application").joinpath("schemas", "judge_labels.schema.json").read_text())
 VALIDATOR = Draft202012Validator(LABEL_SCHEMA)
@@ -62,3 +64,75 @@ def score_labels(labels: dict, sample: Sample) -> dict:
     return {"final_order": order, "coverage": coverage, "correctness": correctness,
             "total": order + coverage + correctness}
 
+
+
+# LEGIT helpers above are used only by the explicit legacy evaluation profile.
+RUBRIC_JUDGE_SCHEMA = load_schema("rubric_judge")
+
+
+def evaluation_plan(sample: Sample) -> dict:
+    issues = []
+    for issue in sample.raw["rubrics"]["issues"]:
+        criteria = criteria_for(issue)
+        blocked = issue_blocked(issue)
+        eligible = [c["criterion_id"] for c in criteria if c["scorable"]]
+        status = "needs_review" if blocked or any(c["needs_review"] for c in criteria) or not eligible else "scored"
+        if not criteria:
+            status = "unscorable"
+        outcome = issue["reference_verdict"] is not None and not blocked
+        issues.append({"issue_index": issue["issue_index"], "evaluation_status": status,
+                       "criterion_ids": eligible, "application_scorable": bool(eligible) and not blocked,
+                       "outcome_scorable": outcome})
+    review = any(row["evaluation_status"] != "scored" or not row["outcome_scorable"] for row in issues)
+    return {"issues": issues, "needs_review": review}
+
+
+def score_rubric_labels(labels: dict, sample: Sample, answer: str) -> dict:
+    try:
+        require_schema(RUBRIC_JUDGE_SCHEMA, labels, "rubric Judge")
+    except ValueError as exc:
+        raise LabelError(str(exc)) from None
+    if labels["doc_name"] != sample.doc_name or labels["category"] != sample.raw["category"]:
+        raise LabelError("Judge doc_name/category mismatch")
+    plan = evaluation_plan(sample)
+    planned_issues = plan["issues"]
+    rows = labels["issues_evaluation"]
+    if len(rows) != len(planned_issues):
+        raise LabelError("Judge must return exactly one result per issue")
+    if labels["needs_review"] != plan["needs_review"] or labels["evaluation_status"] != (
+            "needs_review" if plan["needs_review"] else "completed"):
+        raise LabelError("Judge sample review status does not match the evaluation plan")
+    issue_results = []
+    for row, planned in zip(rows, planned_issues):
+        issue = planned["issue_index"]
+        if row["issue_index"] != issue or row["evaluation_status"] != planned["evaluation_status"]:
+            raise LabelError(f"Issue {issue}: index or review status mismatch")
+        scores = row["criterion_scores"]
+        ids = [item["criterion_id"] for item in scores]
+        if len(ids) != len(set(ids)) or set(ids) != set(planned["criterion_ids"]):
+            raise LabelError(f"Issue {issue}: must score every eligible criterion exactly once")
+        for item in scores:
+            if type(item["score"]) is not int:
+                raise LabelError(f"{item['criterion_id']}: score must be integer 0, 1 or 2")
+            evidence = item["evidence_from_model_answer"]
+            if (item["score"] > 0 and not evidence) or any(not quote.strip() or quote not in answer for quote in evidence):
+                raise LabelError(f"{item['criterion_id']}: cite a short verbatim excerpt of the model answer")
+            if not item["explanation"].strip():
+                raise LabelError(f"{item['criterion_id']}: missing explanation")
+        outcome = row["outcome_correct"]
+        if (outcome is not None) != planned["outcome_scorable"] or not row["outcome_explanation"].strip():
+            raise LabelError(f"Issue {issue}: outcome eligibility or explanation invalid")
+        issue_results.append({"issue_index": issue,
+                              "application_score": sum(item["score"] for item in scores) / (2 * len(scores))
+                              if planned["application_scorable"] else None,
+                              "scored_criteria": len(scores),
+                              "outcome_accuracy": int(outcome) if outcome is not None else None,
+                              "evaluation_status": planned["evaluation_status"]})
+
+    def average(key):
+        values = [row[key] for row in issue_results if row[key] is not None]
+        return mean(values) if values else None
+
+    application = average("application_score")
+    return {"application_score": application, "application_score_10": 10 * application if application is not None else None,
+            "outcome_accuracy": average("outcome_accuracy"), "issues": issue_results}

@@ -9,6 +9,7 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 from .config import Config
 from .pipeline import Pipeline
 from .statistic import StatisticPipeline
+from .rubric_builder import RubricPipeline
 
 
 def main() -> int:
@@ -19,9 +20,12 @@ def main() -> int:
     try:
         config = Config.from_env()
         with logging_redirect_tqdm():
-            runner = StatisticPipeline(config) if config.mode == "statistic" else Pipeline(config)
+            runner = {"statistic": StatisticPipeline, "build-rubrics": RubricPipeline}.get(config.mode, Pipeline)(config)
             summary = asyncio.run(runner.run())
-        print(json.dumps({"run_dir": str(config.run_dir), "status": summary["status"], "counts": summary["counts"], "mean_score": summary["mean_score"]}, ensure_ascii=False))
+        metrics = {key: summary[key] for key in ["application_score", "application_score_10", "outcome_accuracy",
+                                                  "mean_score", "published"] if key in summary}
+        print(json.dumps({"run_dir": str(config.run_dir), "status": summary["status"], "counts": summary["counts"],
+                          **metrics}, ensure_ascii=False))
         return 1 if summary["counts"]["failed"] else 0
     except (ValueError, OSError) as exc:
         logging.error("Run aborted: %s", exc)

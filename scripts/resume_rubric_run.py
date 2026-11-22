@@ -1,0 +1,47 @@
+"""Restore a rubric generation or evaluation run from its saved settings."""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+from legal_application.config import rooted
+from legal_application.data import strict_json
+from resume_statistic import DEFAULT_PROJECT_ROOT, snapshot_environment
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("run_id", help="Existing run ID in OUTPUT_DIR")
+    args = parser.parse_args()
+    try:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.run_id):
+            raise ValueError("RUN_ID must be a simple filename")
+        root = Path(os.environ.get("PROJECT_ROOT", DEFAULT_PROJECT_ROOT)).resolve()
+        output = rooted(root, os.environ.get("OUTPUT_DIR", "outputs"))
+        snapshot = strict_json((output / args.run_id / "config.json").read_text(encoding="utf-8"))
+        if not isinstance(snapshot, dict):
+            raise ValueError("Run config must be a JSON object")
+        if (snapshot.get("run_id") != args.run_id or snapshot.get("project_root") != str(root)
+                or snapshot.get("output_dir") != str(output)):
+            raise ValueError("PROJECT_ROOT, OUTPUT_DIR and RUN_ID must match the saved run")
+        build = snapshot.get("pipeline_kind") == "rubric_generation" and snapshot.get("mode") == "build-rubrics"
+        evaluation = snapshot.get("evaluation_profile") == "rubric" and snapshot.get("mode") in {"full", "judge-only", "validate-only"}
+        if not (build or evaluation):
+            raise ValueError("Expected an existing rubric generation or rubric evaluation run")
+        environment = snapshot_environment(snapshot)
+        if build:
+            environment["RAW_INPUT_JSONL"] = snapshot["input_jsonl"]
+        environment["RESUME"] = "1"
+        os.chdir(root)
+        os.execvpe(sys.executable, [sys.executable, "-m", "legal_application"], environment)
+    except (ValueError, OSError) as exc:
+        print(f"Resume aborted: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

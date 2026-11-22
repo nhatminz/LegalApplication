@@ -1,10 +1,10 @@
 # Legal Application Benchmark
 
-Hướng dẫn đầy đủ từng lệnh với checkpoint local Qwen3-4B, môi trường Python hiện có và concurrency 20: [HUONG_DAN_CHAY.md](HUONG_DAN_CHAY.md).
+Pipeline mặc định đánh giá Rule Application theo rubric riêng của từng issue. Chạy `scripts/generate_rubrics.sh` để sinh dataset Application và gold Issue Spotting đồng bộ. Sau đó dùng `scripts/run_application.sh` để kiểm tra dataset, sinh câu trả lời và chấm từng criterion. Python báo Application Score và Outcome Accuracy độc lập.
 
-Đánh giá năng lực áp dụng pháp luật của LLM trên bản án Việt Nam. Mỗi bản án được gửi trong **một request generator**, gồm toàn bộ facts_clean, issues và luật theo thứ tự gốc. Bài làm là văn bản tự do, giải quyết và đưa ra phán quyết **riêng cho từng issue**. Không yêu cầu phán quyết cuối cùng cho toàn vụ án.
+Các lệnh chạy 10 mẫu trên RTX 3090, chạy 600 mẫu trên B200, judge-only và resume nằm ở đầu [HUONG_DAN_CHAY.md](HUONG_DAN_CHAY.md).
 
-Judge đọc đầy đủ nguồn tham chiếu, suy ra kết quả từng issue trực tiếp từ application/conclusion, gán nhãn và giải thích. Python kiểm tra schema, mapping và tính điểm. Không xây Legal Issue Tree hoặc một pipeline tạo gold riêng.
+Các mục lịch sử dưới đây dùng `EVALUATION_PROFILE=legacy` khi gọi `run_application.sh` với dataset bản án gốc hoặc đọc điểm LEGIT. Các script `statistic.sh`, `filter_full.sh` và `create_task_inputs.sh` vẫn phục vụ bước chuẩn bị dữ liệu.
 
 ## Data Completeness Classification và input có nhãn
 

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from legal_application.data import Sample, parse_sample, strict_json
+from legal_application.data import Sample, parse_sample, rule_inputs, strict_json
 from legal_application.storage import file_hash
 
 FILENAMES = {
@@ -24,8 +24,7 @@ FILENAMES = {
 
 def task_records(sample: Sample) -> dict[str, dict]:
     seed = sample.raw["benchmark_seed"]
-    rules = [{"law_str": block["law_str"], "citation_str": block["citation_str"], "context_text": block["content"]}
-             for block in sample.law_blocks]
+    rules = rule_inputs(sample)
     application_input = {"facts_clean": seed["facts_clean"], "issues": sample.issues, "rules": rules}
     return {
         "issue_spotting": {"input": seed["facts_clean"], "expected_answer": sample.issues},

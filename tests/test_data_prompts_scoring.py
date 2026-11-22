@@ -49,10 +49,10 @@ def test_generator_allowlist_no_reference_leak_and_full_order():
     assert positions == sorted(positions)
     assert all(b["content"] in user for b in sample.law_blocks)
     system = messages[0]["content"]
-    assert "TẤT CẢ issues, đúng thứ tự gốc" in system
-    assert "Phán quyết đối với Issue 1" in system
-    assert "Không thêm phần mở đầu hoặc mục Kết luận chung" in system
-    assert "Không trả JSON" in system
+    assert "theo thứ tự đã cho" in system
+    assert "Fact-to-Rule Application" in system
+    assert "Không cần phán quyết chung cho cả vụ án" in system
+    assert "Trả lời bằng văn bản tự do, tự chọn bố cục" in system
 
 
 def test_judge_gets_entire_reference_and_raw_answer():

@@ -1,0 +1,281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "facts_clean": {
+          "type": "string",
+          "minLength": 1
+        },
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "law_str": {
+                "type": "string",
+                "minLength": 1
+              },
+              "citation_str": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "context_text": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "law_str",
+              "citation_str",
+              "context_text"
+            ]
+          },
+          "minItems": 1
+        }
+      },
+      "required": [
+        "facts_clean",
+        "issues",
+        "rules"
+      ]
+    },
+    "expected_answer": {
+      "type": "string",
+      "minLength": 1
+    },
+    "doc_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "category": {
+      "type": "string",
+      "minLength": 1
+    },
+    "rubrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "enum": [
+            1
+          ]
+        },
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "issue_index": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "issue_text": {
+                "type": "string",
+                "minLength": 1
+              },
+              "groups": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "group_id": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "group_name": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "criteria": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                          "criterion_id": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "unit_id": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "criterion": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "reference_reasoning": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "source_evidence": {
+                            "type": "array",
+                            "items": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "minItems": 1
+                          },
+                          "relevant_facts": {
+                            "type": "array",
+                            "items": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "minItems": 0
+                          },
+                          "rule_refs": {
+                            "type": "array",
+                            "items": {
+                              "type": "integer",
+                              "minimum": 1
+                            },
+                            "minItems": 0
+                          },
+                          "scorable": {
+                            "type": "boolean"
+                          },
+                          "needs_review": {
+                            "type": "boolean"
+                          },
+                          "review_reason": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "missing_information": {
+                            "type": "array",
+                            "items": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "minItems": 0
+                          },
+                          "decisive": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "criterion_id",
+                          "unit_id",
+                          "criterion",
+                          "reference_reasoning",
+                          "source_evidence",
+                          "relevant_facts",
+                          "rule_refs",
+                          "scorable",
+                          "needs_review",
+                          "review_reason",
+                          "missing_information",
+                          "decisive"
+                        ]
+                      },
+                      "minItems": 1
+                    }
+                  },
+                  "required": [
+                    "group_id",
+                    "group_name",
+                    "criteria"
+                  ]
+                },
+                "minItems": 0
+              },
+              "reference_verdict": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "verdict_evidence": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "minItems": 0
+              },
+              "outcome_review_reason": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "issue_review_reason": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "issue_index",
+              "issue_text",
+              "groups",
+              "reference_verdict",
+              "verdict_evidence",
+              "outcome_review_reason",
+              "issue_review_reason"
+            ]
+          },
+          "minItems": 1
+        }
+      },
+      "required": [
+        "version",
+        "issues"
+      ]
+    }
+  },
+  "required": [
+    "input",
+    "expected_answer",
+    "doc_name",
+    "category",
+    "rubrics"
+  ]
+}

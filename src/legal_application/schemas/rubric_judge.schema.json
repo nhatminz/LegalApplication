@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "doc_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "category": {
+      "type": "string",
+      "minLength": 1
+    },
+    "issues_evaluation": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "issue_index": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "evaluation_status": {
+            "enum": [
+              "scored",
+              "needs_review",
+              "unscorable"
+            ]
+          },
+          "criterion_scores": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "criterion_id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "score": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 2
+                },
+                "evidence_from_model_answer": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "minItems": 0
+                },
+                "explanation": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "criterion_id",
+                "score",
+                "evidence_from_model_answer",
+                "explanation"
+              ]
+            },
+            "minItems": 0
+          },
+          "outcome_correct": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "outcome_explanation": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "issue_index",
+          "evaluation_status",
+          "criterion_scores",
+          "outcome_correct",
+          "outcome_explanation"
+        ]
+      },
+      "minItems": 1
+    },
+    "needs_review": {
+      "type": "boolean"
+    },
+    "evaluation_status": {
+      "enum": [
+        "completed",
+        "needs_review"
+      ]
+    }
+  },
+  "required": [
+    "doc_name",
+    "category",
+    "issues_evaluation",
+    "needs_review",
+    "evaluation_status"
+  ]
+}

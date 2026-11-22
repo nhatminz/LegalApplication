@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 def statistic_snapshot(config) -> dict:
     snapshot = config.snapshot()
     for key in list(snapshot):
-        if key.startswith("generator_") or key == "generation_jsonl":
+        if key.startswith("generator_") or key in {"generation_jsonl", "evaluation_profile", "expected_count"}:
             snapshot.pop(key)
     snapshot.update(pipeline_kind="data_completeness", artifact_version=1,
                     input_sha256=file_hash(config.input_jsonl), implementation_sha256=implementation_hash(),

@@ -12,8 +12,10 @@ from .api import APIClient, APIError, IncompleteResponse
 from .config import Config
 from .data import DatasetError, Sample, canonical_hash, read_dataset, strict_json
 from .input_cleanup import clean_input
-from .prompts import generator_messages, judge_messages
-from .scoring import LABEL_SCHEMA, LabelError, score_labels
+from .prompts import generator_messages, judge_messages, rubric_generator_messages, rubric_judge_messages
+from .scoring import LABEL_SCHEMA, RUBRIC_JUDGE_SCHEMA, LabelError, score_labels, score_rubric_labels
+from .rubrics import rubric_sample
+from .rubric_taxonomy import canonical_category
 from .storage import RunStore, file_hash, implementation_hash, now, read_jsonl
 from .filter_full import verify_full_manifest
 from .thinking import resolve_thinking
@@ -77,15 +79,19 @@ async def bounded_map(items: list, concurrency: int, process, on_done=None) -> N
 
 async def judge_sample(config: Config, sample: Sample, generation: dict, client: APIClient) -> dict:
     repair, calls, validation_errors = None, [], []
+    rubric = config.evaluation_profile == "rubric"
+    schema = RUBRIC_JUDGE_SCHEMA if rubric else LABEL_SCHEMA
+    messages = rubric_judge_messages if rubric else judge_messages
     for attempt in range(config.judge_json_retries + 1):
         try:
-            completion = await client.complete(judge_messages(sample, generation["raw_response"], LABEL_SCHEMA, repair), doc_name=sample.doc_name)
+            completion = await client.complete(messages(sample, generation["raw_response"], schema, repair),
+                                               doc_name=sample.doc_name, schema=schema)
             calls.append(completion.metadata)
             try:
                 labels = strict_json(completion.content)
             except ValueError:
                 raise LabelError("response is not a strict JSON object") from None
-            components = score_labels(labels, sample)
+            components = (score_rubric_labels(labels, sample, generation["raw_response"]) if rubric else score_labels(labels, sample))
             return {**labels, **sample.identity(), "score_components": components,
                     "generator_model": generation["model"], "judge_model": config.judge_model,
                     "generation_sha256": generation["generation_sha256"],
@@ -99,7 +105,10 @@ async def judge_sample(config: Config, sample: Sample, generation: dict, client:
             validation_errors.append(repair)
             log.warning("Judge invalid doc_name=%s label_attempt=%d reason=%s", sample.doc_name, attempt + 1, repair)
             if attempt == config.judge_json_retries:
-                raise APIError("judge exhausted structured-output retries", {"judge_calls": calls, "validation_errors": validation_errors}) from None
+                message = "judge exhausted structured-output retries"
+                if rubric:
+                    message += f": {repair}"
+                raise APIError(message, {"judge_calls": calls, "validation_errors": validation_errors}) from None
             if config.retry_backoff:
                 await asyncio.sleep(min(60.0, config.retry_backoff * 2 ** attempt))
     raise AssertionError("unreachable")
@@ -126,6 +135,56 @@ class Pipeline:
         self.errors.append(record)
         log.error("Sample failed stage=%s doc_name=%s input_index=%d error=%s", stage, sample.doc_name, sample.input_index, exc)
 
+    def rubric_summary(self, dataset, status, generation_failures, evaluation_failures, failed_docs, attempted):
+        selected = len(dataset.samples)
+        evaluations = self.evaluations
+
+        def metrics(samples):
+            names = {sample.doc_name for sample in samples}
+            results = [evaluations[name] for name in sorted(names & evaluations.keys())]
+            components = [row["score_components"] for row in results]
+            application = [row["application_score"] for row in components if row["application_score"] is not None]
+            outcomes = [row["outcome_accuracy"] for row in components if row["outcome_accuracy"] is not None]
+            issue_results = [issue for row in components for issue in row["issues"]]
+            return {
+                "selected": len(names), "completed": len(results), "failed": len(names & failed_docs), "invalid": 0,
+                "needs_review": sum(row["needs_review"] for row in results),
+                "issue_review_count": sum(issue["evaluation_status"] != "scored" or issue["outcome_accuracy"] is None
+                                          for issue in issue_results),
+                "unscorable_issues": sum(issue["application_score"] is None for issue in issue_results),
+                "unscorable_samples": len(components) - len(application),
+                "application_scored_samples": len(application), "outcome_scored_samples": len(outcomes),
+                "application_score": mean(application) if application else None,
+                "application_score_10": 10 * mean(application) if application else None,
+                "outcome_accuracy": mean(outcomes) if outcomes else None,
+            }
+
+        def stage(name, rows, failures):
+            return {"completed": len(rows), "failed": len(failures), "pending": selected - len(rows) - len(failures),
+                    "this_invocation": self.counters[name]}
+
+        by_category = {}
+        for sample in dataset.samples:
+            by_category.setdefault(canonical_category(sample.raw["category"]), []).append(sample)
+        overall = metrics(dataset.samples)
+        return {
+            "run_id": self.config.run_id, "status": status, "updated_at": now(), "evaluation_profile": "rubric",
+            "counts": {"input": dataset.input_count, "input_valid": dataset.valid_count, "selected": selected,
+                       "attempted": len(attempted), "completed": len(evaluations), "failed": len(failed_docs),
+                       "pending": selected - len(evaluations) - len(failed_docs), "skipped": self.preexisting_evaluations,
+                       "scored": overall["application_scored_samples"], "needs_review": overall["needs_review"],
+                       "invalid": 0, "unscorable": overall["unscorable_samples"]},
+            "application_score": overall["application_score"], "application_score_10": overall["application_score_10"],
+            "outcome_accuracy": overall["outcome_accuracy"],
+            "metrics": overall, "by_category": {category: metrics(samples) for category, samples in by_category.items()},
+            "generation": stage("generation", self.generations, generation_failures),
+            "evaluation": stage("evaluation", evaluations, evaluation_failures),
+            "needs_review_doc_names": sorted(doc for doc, row in evaluations.items() if row["needs_review"]),
+            "failed_doc_names": sorted(failed_docs), "error_events": len(self.errors),
+            "invocation_id": self.invocation_id, "models": {"generator": sorted({r["model"] for r in self.generations.values()}),
+                                                           "judge": self.config.judge_model},
+        }
+
     def summary(self, dataset, status: str) -> dict:
         selected = len(dataset.samples)
         scored = [v for v in self.evaluations.values() if v["evaluation_status"] == "completed"]
@@ -136,6 +195,8 @@ class Pipeline:
         evaluation_failures -= self.evaluations.keys()
         failed_docs = (generation_failures | evaluation_failures) - self.evaluations.keys()
         attempted = set(self.generations) | set(self.evaluations) | {e["doc_name"] for e in self.errors}
+        if self.config.evaluation_profile == "rubric":
+            return self.rubric_summary(dataset, status, generation_failures, evaluation_failures, failed_docs, attempted)
         histogram = {f"{i}–{i+1}" if i < 9 else "9–10 inclusive": 0 for i in range(10)}
         exact = Counter()
         for row in scored:
@@ -154,6 +215,7 @@ class Pipeline:
                            "attempted": len(attempted), "completed": len(self.evaluations), "failed": len(failed_docs),
                            "pending": selected - len(self.evaluations) - len(failed_docs),
                            "skipped": self.preexisting_evaluations, "scored": len(scored), "needs_review": review},
+                "evaluation_profile": "legacy",
                 "input_cleanup": self.input_cleanup,
                 "data_status_used": "full_only",
                 "data_status_counts": {"input": dataset.status_counts,
@@ -196,8 +258,6 @@ class Pipeline:
                                    "counts": {"input": getattr(self, "input_count", None), "selected": getattr(self, "selected_count", 0),
                                               "attempted": 0, "completed": 0, "failed": 0, "skipped": 0,
                                               "scored": 0, "needs_review": 0},
-                                   "mean_score": None,
-                                   "mean_score_components": dict.fromkeys(["final_order", "coverage", "correctness", "total"]),
                                    "fatal_error": {"error_type": type(exc).__name__, "error": str(exc)}})
                 raise
             finally:
@@ -209,7 +269,9 @@ class Pipeline:
         config = self.config
         generator_thinking = resolve_thinking(config.generator_thinking_mode)
         judge_thinking = resolve_thinking(config.judge_thinking_mode)
-        full_manifest = verify_full_manifest(config.input_jsonl)
+        rubric = config.evaluation_profile == "rubric"
+        full_manifest = verify_full_manifest(config.input_jsonl) if not rubric else None
+        rubric_manifest = config.input_jsonl.with_name(config.input_jsonl.name + ".manifest.json")
         snapshot = {**config.snapshot(), "artifact_version": 1, "implementation_sha256": implementation_hash(),
                     "full_input_manifest_sha256": file_hash(config.input_jsonl.with_name(config.input_jsonl.name + ".manifest.json")) if full_manifest else None,
                     "generation_source_sha256": file_hash(config.generation_jsonl) if config.generation_jsonl else None,
@@ -217,43 +279,61 @@ class Pipeline:
                     "judge_reasoning_effort": judge_thinking["effort"],
                     "judge_reasoning_parameters": judge_thinking["parameters"].get("chat_template_kwargs", {})}
         log.info("Run start run_id=%s mode=%s limit=%s batch_size=%d invocation=%s", config.run_id, config.mode, config.limit, config.batch_size, self.invocation_id)
-        # Validate labels across ALL records before the existing cleanup can mutate input.
-        # This also protects filtered records and records beyond LIMIT from guessed labels.
-        with config.input_jsonl.open("rb") as source:
-            for line_number, line in enumerate(source, 1):
-                try:
-                    raw = strict_json(line.decode("utf-8"))
-                except (ValueError, UnicodeError):
-                    continue  # Existing cleanup journals malformed JSON separately.
-                if isinstance(raw, dict) and raw.get("data_status") not in ("full", "partial"):
-                    if not full_manifest or "data_status" in raw:
-                        raise ValueError(f"{config.input_jsonl}:{line_number}: data_status must be full or partial; use scripts/filter_full.sh for raw input")
-                if full_manifest and isinstance(raw, dict) and raw.get("data_status", "full") != "full":
-                    raise ValueError("Full-input manifest contradicts the record's data_status")
-        self.input_cleanup = clean_input(config.input_jsonl, store.path,
-                                        lambda digest: store.configure({**snapshot, "input_sha256": digest}))
-        snapshot["input_sha256"] = self.input_cleanup["input_sha256_after"]
+        if not rubric:
+            # Validate labels across ALL records before the existing cleanup can mutate input.
+            # This also protects filtered records and records beyond LIMIT from guessed labels.
+            with config.input_jsonl.open("rb") as source:
+                for line_number, line in enumerate(source, 1):
+                    try:
+                        raw = strict_json(line.decode("utf-8"))
+                    except (ValueError, UnicodeError):
+                        continue  # Existing cleanup journals malformed JSON separately.
+                    if isinstance(raw, dict) and raw.get("data_status") not in ("full", "partial"):
+                        if not full_manifest or "data_status" in raw:
+                            raise ValueError(f"{config.input_jsonl}:{line_number}: data_status must be full or partial; use scripts/filter_full.sh for raw input")
+                    if full_manifest and isinstance(raw, dict) and raw.get("data_status", "full") != "full":
+                        raise ValueError("Full-input manifest contradicts the record's data_status")
+            self.input_cleanup = clean_input(config.input_jsonl, store.path,
+                                            lambda digest: store.configure({**snapshot, "input_sha256": digest}))
+            snapshot["input_sha256"] = self.input_cleanup["input_sha256_after"]
         for role, settings in [("generator", generator_thinking), ("judge", judge_thinking)]:
             log.info("Thinking role=%s mode=%s backend=%s enabled=%s budget=%s parameters=%s", role,
                      settings["requested_mode"], settings["backend"], settings["thinking_enabled"],
                      settings["effort_budget"], settings["parameters"])
         try:
-            dataset = read_dataset(config.input_jsonl, config.limit, application=True, verified_full=bool(full_manifest))
+            if rubric:
+                dataset = read_dataset(config.input_jsonl, config.limit, parser=rubric_sample)
+                if config.expected_count is not None and dataset.input_count != config.expected_count:
+                    raise ValueError(f"EXPECTED_COUNT={config.expected_count}, found {dataset.input_count} dataset rows")
+                snapshot["input_sha256"] = dataset.sha256
+                if rubric_manifest.is_file():
+                    manifest = strict_json(rubric_manifest.read_text(encoding="utf-8"))
+                    if (not isinstance(manifest, dict) or manifest.get("kind") != "rule_application_rubrics"
+                            or manifest.get("complete") is not True or manifest.get("sample_count") != dataset.input_count
+                            or not isinstance(manifest.get("application"), dict)
+                            or manifest["application"].get("sha256") != dataset.sha256):
+                        raise ValueError("Rubric dataset does not match its publication manifest")
+                    snapshot["rubric_manifest_sha256"] = canonical_hash(manifest)
+                store.configure(snapshot)
+            else:
+                dataset = read_dataset(config.input_jsonl, config.limit, application=True, verified_full=bool(full_manifest))
         except DatasetError as exc:
             for error in exc.errors:
                 log.error("Input invalid line=%s error=%s", error["input_line"], error["error"])
             summary = {"run_id": config.run_id, "status": "input_validation_failed",
-                       "counts": {"input": self.input_cleanup["original_line_count"], "input_valid": exc.valid_count,
-                                  "input_removed": self.input_cleanup["removed_count"], "selected": 0,
+                       "counts": {"input": self.input_cleanup.get("original_line_count", exc.input_count), "input_valid": exc.valid_count,
+                                  "input_removed": self.input_cleanup.get("removed_count", 0), "invalid": len(exc.errors), "selected": 0,
                                   "attempted": 0, "completed": 0, "failed": 0, "skipped": 0, "scored": 0, "needs_review": 0},
                        "input_validation_error_count": len(exc.errors), "input_validation_errors": exc.errors,
                        "input_cleanup": self.input_cleanup,
-                       "mean_score": None, "mean_score_components": dict.fromkeys(["final_order", "coverage", "correctness", "total"]),
+                       "invalid_by_category": dict(Counter(error.get("category", "unknown") for error in exc.errors)),
                        "updated_at": now()}
             store.summary(summary)
             raise
         if dataset.sha256 != snapshot["input_sha256"]:
             raise ValueError("Input changed during validation; no API requests made")
+        if rubric and file_hash(config.input_jsonl) != dataset.sha256:
+            raise ValueError("Rubric dataset changed during validation; no API requests made")
         if full_manifest and (dataset.sha256 != full_manifest["output_sha256"] or dataset.valid_count != full_manifest["sample_count"]):
             raise ValueError("Full-input manifest no longer matches the validated input")
         self.input_count = dataset.input_count
@@ -280,8 +360,13 @@ class Pipeline:
             for key, value in samples[doc].identity().items():
                 if record.get(key) != value:
                     raise ValueError(f"Evaluation identity mismatch: {doc}, {key}")
-            labels = {key: record.get(key) for key in LABEL_SCHEMA["properties"]}
-            if score_labels(labels, samples[doc]) != record.get("score_components"):
+            schema = RUBRIC_JUDGE_SCHEMA if rubric else LABEL_SCHEMA
+            labels = {key: record.get(key) for key in schema["properties"]}
+            components = (score_rubric_labels(labels, samples[doc], self.generations[doc]["raw_response"])
+                          if rubric else score_labels(labels, samples[doc]))
+            if rubric and strict_json(record["raw_judge_response"]) != labels:
+                raise ValueError(f"Stored Judge response differs from rubric labels: {doc}")
+            if components != record.get("score_components"):
                 raise ValueError(f"Stored evaluation scores inconsistent with labels: {doc}")
             if record.get("generation_sha256") != self.generations[doc]["generation_sha256"] or record.get("judge_model") != config.judge_model:
                 raise ValueError(f"Evaluation generation/judge mapping mismatch: {doc}")
@@ -323,12 +408,13 @@ class Pipeline:
                 else:
                     counters["attempted"] += 1
                     try:
-                        completion = await generator.complete(generator_messages(sample), doc_name=sample.doc_name)
+                        messages = rubric_generator_messages(sample) if rubric else generator_messages(sample)
+                        completion = await generator.complete(messages, doc_name=sample.doc_name)
                     except APIError as exc:
                         counters["failed"] += 1
                         self.failure(store, sample, "generation", exc)
                         return
-                    record = {**sample.identity(), "model": config.generator_model, "status": "completed",
+                    record = {**sample.identity(), "run_id": config.run_id, "model": config.generator_model, "status": "completed",
                               "raw_response": completion.content, "generation_sha256": canonical_hash(completion.content),
                               "metadata": {**completion.metadata, "completed_at": now(), "law_sources": [
                                   {key: block[key] for key in ["law_index", "provision_index", "source", "fallback"]}
@@ -356,7 +442,7 @@ class Pipeline:
                 store.append("evaluations.jsonl", record)
                 self.evaluations[sample.doc_name] = record
                 counters["completed"] += 1
-                log.info("Evaluation saved doc_name=%s input_index=%d status=%s score=%s", sample.doc_name, sample.input_index, record["evaluation_status"], record["score_components"]["total"])
+                log.info("Evaluation saved doc_name=%s input_index=%d status=%s score=%s", sample.doc_name, sample.input_index, record["evaluation_status"], record["score_components"]["application_score" if rubric else "total"])
 
             store.summary(self.summary(dataset, "running"))
             saved_generations, saved_evaluations = set(self.generations), set(self.evaluations)

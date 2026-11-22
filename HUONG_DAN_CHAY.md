@@ -1,5 +1,85 @@
 # Hướng dẫn chạy Legal Application Benchmark trên B200
 
+## Rule Application theo rubric
+
+Chạy các lệnh trong môi trường Python đã activate. `generate_rubrics.sh` gọi endpoint DeepSeek có sẵn tại `http://172.29.116.48:8000/v1`, mặc định dùng `DeepSeek-V4.1-Flash-1017` và `deepseek_vllm_xhigh` (effort 75). Sửa `RUBRIC_BASE_URL`, `RUBRIC_MODEL`, `RUBRIC_API_KEY`, `RUBRIC_THINKING_MODE`, `RUBRIC_CONCURRENCY` hoặc `RUBRIC_MAX_OUTPUT_TOKENS` qua biến môi trường khi cần. `RUBRIC_RESPONSE_FORMAT=json_object` dùng khi endpoint chỉ hỗ trợ chế độ JSON object. Python vẫn kiểm tra cùng schema.
+
+### Thử 10 mẫu trên RTX 3090
+
+```bash
+export PROJECT_ROOT=/mnt/hdd/nhatminh/LegalApplication
+cd "$PROJECT_ROOT"
+
+RAW_INPUT_JSONL="$PROJECT_ROOT/input/sample_v2.jsonl" \
+  FINAL_APPLICATION_JSONL="$PROJECT_ROOT/outputs/rubric-smoke/application.jsonl" \
+  FINAL_ISSUE_SPOTTING_JSONL="$PROJECT_ROOT/outputs/rubric-smoke/issue_spotting.jsonl" \
+  EXPECTED_COUNT=10 LIMIT=10 BATCH_SIZE=2 RUBRIC_CONCURRENCY=2 \
+  RUN_ID=rubric-smoke-10 RESUME=0 bash scripts/generate_rubrics.sh
+```
+
+### Sinh và kiểm tra 600 mẫu trên B200
+
+```bash
+export PROJECT_ROOT=/workspace/storage-shared/nlp/users/minhpn19/LegalApplication
+export OUTPUT_DIR="$PROJECT_ROOT/outputs"
+export FINAL_APPLICATION_JSONL="$PROJECT_ROOT/input/final/final_600_rule_application.jsonl"
+export FINAL_ISSUE_SPOTTING_JSONL="$PROJECT_ROOT/input/final/final_600_issue_spotting.jsonl"
+cd "$PROJECT_ROOT"
+
+RAW_INPUT_JSONL="$PROJECT_ROOT/input/final_raw_600_input_application.jsonl" \
+  EXPECTED_COUNT=600 LIMIT=all BATCH_SIZE=20 RUBRIC_CONCURRENCY=20 \
+  RUN_ID=rubric-600-v1 RESUME=0 bash scripts/generate_rubrics.sh
+
+EVALUATION_PROFILE=rubric INPUT_JSONL="$FINAL_APPLICATION_JSONL" \
+  MODE=validate-only EXPECTED_COUNT=600 LIMIT=all RUN_ID=validate-rubric-600-v1 \
+  RESUME=0 bash scripts/run_application.sh
+```
+
+Script kiểm tra toàn bộ file nguồn, kể cả các dòng ngoài `LIMIT`. Nếu `LIMIT` nhỏ hơn tổng số dòng, kết quả đủ của tập con được ghi dưới run directory với hậu tố `_subset.jsonl`. Hai file final cùng manifest chỉ được xuất với đủ số mẫu yêu cầu và rubric của mọi mẫu đã qua kiểm định. Script từ chối ghi đè nếu một file đích đã tồn tại với nội dung khác. Khi xuất thành công, manifest nằm cạnh Application với hậu tố `.manifest.json`, có checksum của cả hai file và đối chiếu `doc_name` theo dòng gốc. Để đánh giá một phiên bản đã xuất, dùng file Application và manifest đi cùng.
+
+### Chạy đánh giá
+
+`GENERATOR_BASE_URL` và `GENERATOR_MODEL` phải khớp endpoint và served model bạn muốn đánh giá. Judge có các biến `JUDGE_BASE_URL`, `JUDGE_MODEL`, `JUDGE_API_KEY`, `JUDGE_THINKING_MODE` và `JUDGE_RESPONSE_FORMAT` riêng. Ví dụ với Qwen3-4B đã host ở port 8001:
+
+```bash
+GENERATOR_BASE_URL=http://127.0.0.1:8001/v1 GENERATOR_MODEL=Qwen/Qwen3-4B \
+  JUDGE_BASE_URL=http://172.29.116.48:8000/v1 JUDGE_MODEL=DeepSeek-V4.1-Flash-1017 \
+  EVALUATION_PROFILE=rubric MODE=full EXPECTED_COUNT=600 LIMIT=all \
+  INPUT_JSONL="$FINAL_APPLICATION_JSONL" RUN_ID=evaluate-qwen3-4b-rubric-v1 \
+  RESUME=0 bash scripts/run_application.sh
+```
+
+Chấm lại cùng câu trả lời bằng Judge khác trong một run riêng:
+
+```bash
+EVALUATION_PROFILE=rubric MODE=judge-only EXPECTED_COUNT=600 LIMIT=all \
+  INPUT_JSONL="$FINAL_APPLICATION_JSONL" \
+  GENERATION_JSONL="$OUTPUT_DIR/evaluate-qwen3-4b-rubric-v1/generations.jsonl" \
+  RUN_ID=rejudge-rubric-v1 RESUME=0 bash scripts/run_application.sh
+```
+
+### Tiếp tục run và đọc báo cáo
+
+Dùng đúng run ID trong `OUTPUT_DIR`. Helper khôi phục cấu hình đã lưu và tiếp tục các sample chưa hoàn thành. Nếu API cần xác thực, export lại API key trong terminal hiện tại.
+
+```bash
+bash scripts/resume_rubric_run.sh rubric-600-v1
+# Hoặc tiếp tục run đánh giá
+bash scripts/resume_rubric_run.sh evaluate-qwen3-4b-rubric-v1
+```
+
+`config.json` cố định code, input, endpoint, model, thinking, lịch batch, giới hạn và các cài đặt của run. Sau khi đổi code hoặc rubric, dùng run ID mới. Các run statistic trước refactor cần bản code tương ứng hoặc nhập lại kết quả hợp lệ qua `retry_statistic.sh`.
+
+Mỗi sample qua ba lượt gọi rubric gồm phân rã nhận định, ánh xạ vào issues, rồi kiểm định ngữ nghĩa từ nguồn. Bước Python xác minh evidence nguyên văn, đơn vị nguồn, ID, thứ tự và phạm vi. Các nhóm nhận định tham khảo [Điều 260 Bộ luật Tố tụng hình sự 2015](https://vanban.chinhphu.vn/default.aspx?docid=183217&pageid=27160), [Điều 266 Bộ luật Tố tụng dân sự 2015](https://vanban.chinhphu.vn/?classid=1&docid=183189&pageid=27160&typegroupid=3) và [Điều 194 Luật Tố tụng hành chính 2015](https://vanban.chinhphu.vn/default.aspx?docid=183190&pageid=27160). Category và cấp xét xử dùng trong quá trình sinh rubric. Cả năm category đã xuất hiện trong file mẫu. Category chưa hỗ trợ gây lỗi validation có số dòng.
+
+Trong run sinh rubric, xem `rubric_generation_summary.json` để biết số mẫu hoàn thành, lỗi và những `doc_name` còn thiếu. `rubric_coverage_report.json` báo tỷ lệ theo các unit thuộc phạm vi mà lượt audit đã chấp nhận, kèm số mẫu chưa được kiểm định thành công. `source_units.jsonl`, `added_issues.jsonl` và `excluded_units.jsonl` lưu nguồn và quyết định ánh xạ. `rubric_review.jsonl` lưu thiếu hụt input, verdict chưa xác định và lỗi sinh rubric. Issue gốc chưa có nhận định hỗ trợ được giữ cùng lý do review và danh sách nhóm rỗng.
+
+Trong run đánh giá, `generations.jsonl` lưu nguyên văn câu trả lời. `evaluations.jsonl` lưu từng criterion, bằng chứng trích từ câu trả lời, điểm issue và Outcome Accuracy. Application Score lấy trung bình các issue đủ điều kiện, rồi lấy trung bình các sample đủ điều kiện. Outcome Accuracy có mẫu số riêng. Issue có thiếu hụt quyết định được loại khỏi điểm chính. Điểm của các criterion còn đủ căn cứ vẫn có trong chi tiết. `summary.json` báo hai metric cùng số mẫu và issue review theo category.
+
+## Hướng dẫn chuẩn bị dữ liệu và đánh giá legacy
+
+Các ví dụ lịch sử bên dưới gọi `run_application.sh` với schema bản án gốc và điểm LEGIT. Trong terminal chạy các ví dụ đó, đặt `export EVALUATION_PROFILE=legacy`.
+
 Ví dụ xuyên suốt dùng checkpoint local:
 
 ```text

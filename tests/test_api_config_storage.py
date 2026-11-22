@@ -138,7 +138,7 @@ def test_env_relative_paths_and_no_default_limit(monkeypatch, tmp_path):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
     config = Config.from_env()
-    assert config.input_jsonl == tmp_path / "input/input_application_clean_v1.jsonl"
+    assert config.input_jsonl == tmp_path / "input/final/final_600_rule_application.jsonl"
     assert config.output_dir == tmp_path / "outputs"
     assert config.limit is None
     monkeypatch.setenv("LIMIT", "0")

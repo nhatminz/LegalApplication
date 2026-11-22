@@ -61,6 +61,7 @@ def config_factory(tmp_path):
         records = records if records is not None else [make_record()]
         path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records), encoding="utf-8")
         return replace(Config(project_root=tmp_path, input_jsonl=path, output_dir=tmp_path / "outputs", run_id="test-run",
+                              evaluation_profile="legacy",
                               generator_base_url="http://generator.test/v1", generator_model="evaluated-model",
                               judge_base_url="http://judge.test/v1", api_max_retries=1, judge_json_retries=1, retry_backoff=0), **changes)
     return factory

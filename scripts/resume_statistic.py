@@ -115,7 +115,7 @@ def prepare_resume(root: Path, output_dir: Path, run_id: str, *, batch_size: int
         return updated
 
 
-def resume_environment(snapshot: dict) -> dict:
+def snapshot_environment(snapshot: dict) -> dict:
     environment = os.environ.copy()
     aliases = {"timeout_seconds": "API_TIMEOUT_SECONDS", "retry_backoff": "RETRY_BACKOFF_SECONDS"}
     allowed = {field.name for field in fields(Config)}
@@ -125,6 +125,11 @@ def resume_environment(snapshot: dict) -> dict:
         if value is None:
             value = "all" if key == "limit" else ""
         environment[aliases.get(key, key.upper())] = str(value)
+    return environment
+
+
+def resume_environment(snapshot: dict) -> dict:
+    environment = snapshot_environment(snapshot)
     # These fields do not participate in statistic requests/snapshots.
     environment.pop("DATA_STATUS_USED", None)
     environment.update(RESUME="1", MODE="statistic", GENERATION_JSONL="",

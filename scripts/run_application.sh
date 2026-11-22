@@ -19,14 +19,21 @@ export GENERATOR_THINKING_MODE="${GENERATOR_THINKING_MODE:-none}"
 
 # Runtime paths are based on PROJECT_ROOT. Relative path exports also resolve from it.
 export PROJECT_ROOT="${PROJECT_ROOT:-/workspace/storage-shared/nlp/users/minhpn19/LegalApplication}"
-# Record JSON/schema lỗi (kể cả issues rỗng) được ghi log rồi xóa khỏi INPUT_JSONL.
-export INPUT_JSONL="${INPUT_JSONL:-${PROJECT_ROOT}/input/input_application_clean_v1.jsonl}"
+export EVALUATION_PROFILE="${EVALUATION_PROFILE:-rubric}"
+export FINAL_APPLICATION_JSONL="${FINAL_APPLICATION_JSONL:-${PROJECT_ROOT}/input/final/final_600_rule_application.jsonl}"
+if [[ "$EVALUATION_PROFILE" == legacy ]]; then
+  export INPUT_JSONL="${INPUT_JSONL:-${PROJECT_ROOT}/input/input_application_clean_v1.jsonl}"
+else
+  export INPUT_JSONL="${INPUT_JSONL:-$FINAL_APPLICATION_JSONL}"
+fi
+export EXPECTED_COUNT="${EXPECTED_COUNT:-}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs}"
 export RUN_ID="${RUN_ID:-}"  # Empty -> Vietnam local timestamp + random suffix.
 export MODE="${MODE:-full}"  # full | judge-only | validate-only
+unset STATISTIC_SEED_JSONL
 export GENERATION_JSONL="${GENERATION_JSONL:-}"
 export RESUME="${RESUME:-0}"
-# Application luôn chỉ chọn full; file gốc không có nhãn cần manifest từ filter_full.sh.
+# Rubric evaluation đọc dataset final ở chế độ chỉ đọc.
 
 # MODEL JUDGE: chấm bài làm của generator, mặc định DeepSeek với effort xhigh.
 export JUDGE_BASE_URL="${JUDGE_BASE_URL:-http://172.29.62.173:8000/v1}"
