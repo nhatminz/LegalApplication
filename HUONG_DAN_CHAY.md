@@ -4,7 +4,7 @@
 
 Chạy các lệnh trong môi trường Python đã activate. `generate_rubrics.sh` gọi endpoint DeepSeek có sẵn tại `http://172.29.116.48:8000/v1`, mặc định dùng `DeepSeek-V4.1-Flash-1017` và `deepseek_vllm_xhigh` (effort 75). Sửa `RUBRIC_BASE_URL`, `RUBRIC_MODEL`, `RUBRIC_API_KEY`, `RUBRIC_THINKING_MODE`, `RUBRIC_CONCURRENCY` hoặc `RUBRIC_MAX_OUTPUT_TOKENS` qua biến môi trường khi cần. `RUBRIC_RESPONSE_FORMAT=json_object` dùng khi endpoint chỉ hỗ trợ chế độ JSON object. Python vẫn kiểm tra cùng schema.
 
-### Thử 10 mẫu trên RTX 3090
+### Thử 10 mẫu từ máy truy cập được endpoint DeepSeek
 
 ```bash
 export PROJECT_ROOT=/mnt/hdd/nhatminh/LegalApplication
@@ -28,14 +28,14 @@ cd "$PROJECT_ROOT"
 
 RAW_INPUT_JSONL="$PROJECT_ROOT/input/final_raw_600_input_application.jsonl" \
   EXPECTED_COUNT=600 LIMIT=all BATCH_SIZE=20 RUBRIC_CONCURRENCY=20 \
-  RUN_ID=rubric-600-v1 RESUME=0 bash scripts/generate_rubrics.sh
+  RUN_ID=rubric-600-simple-v1 RESUME=0 bash scripts/generate_rubrics.sh
 
 EVALUATION_PROFILE=rubric INPUT_JSONL="$FINAL_APPLICATION_JSONL" \
-  MODE=validate-only EXPECTED_COUNT=600 LIMIT=all RUN_ID=validate-rubric-600-v1 \
+  MODE=validate-only EXPECTED_COUNT=600 LIMIT=all RUN_ID=validate-rubric-600-simple-v1 \
   RESUME=0 bash scripts/run_application.sh
 ```
 
-Script kiểm tra toàn bộ file nguồn, kể cả các dòng ngoài `LIMIT`. Khi chọn tập con, kết quả được lưu trong `rule_application_draft.jsonl` của run. Pipeline tự xuất hai file final và manifest khi đủ số mẫu và mọi rubric đã qua semantic audit. Issue bổ sung đã qua audit và các mục cần xem lại được ghi vào `rubric_review.jsonl`. Nếu file final đã tồn tại, chỉ định cặp path mới cho lần sinh mới. File Application v2 cần manifest `.manifest.json` đi cùng để validate hoặc evaluate.
+Script kiểm tra toàn bộ file nguồn, kể cả các dòng ngoài `LIMIT`. Mỗi mẫu thường cần một lượt gọi DeepSeek. Mẫu có đủ rubric cho mọi gold issue được ghi ngay vào Application và Issue Spotting. Issue bổ sung hợp lệ được đưa vào cả hai file cùng lúc và có ghi chú trong `added_issues.jsonl`. Với run thử, đặt hai đường dẫn output riêng như ví dụ 10 mẫu. Với run mới, hai đường dẫn output phải còn trống.
 
 Dùng `LIMIT=0` để kiểm tra riêng dữ liệu raw trước khi gọi API.
 
@@ -71,30 +71,31 @@ EVALUATION_PROFILE=rubric MODE=judge-only EXPECTED_COUNT=600 LIMIT=all \
 Dùng đúng run ID trong `OUTPUT_DIR`. Helper khôi phục cấu hình đã lưu và tiếp tục các sample chưa hoàn thành. Nếu API cần xác thực, export lại API key trong terminal hiện tại.
 
 ```bash
-bash scripts/resume_rubric_run.sh rubric-600-v1
+bash scripts/resume_rubric_run.sh rubric-600-simple-v1
 # Hoặc tiếp tục run đánh giá
 bash scripts/resume_rubric_run.sh evaluate-qwen3-4b-rubric-v1
 ```
 
 `config.json` cố định code, input, endpoint, model, thinking, lịch batch, giới hạn và các cài đặt của run. Sau khi đổi code hoặc rubric, dùng run ID mới. Các run statistic trước refactor cần bản code tương ứng hoặc nhập lại kết quả hợp lệ qua `retry_statistic.sh`.
 
-Với run sinh rubric đã có mẫu thành công và cần chạy lại bằng code mới, dùng dir name của run cũ và một RUN_ID mới.
+Resume giữ các mẫu đã lưu và chạy tiếp các mẫu thiếu hoặc từng lỗi. Hai file final có cùng thứ tự hoàn thành. Nếu một lần ngắt để lại dòng ghi dở, resume khôi phục dữ liệu từ checkpoint `rubric_records.jsonl`. Hãy sửa rubric thủ công sau khi run hoàn tất.
+
+Nếu đã đổi code và checkpoint nguồn dùng rubric v3, chuyển các mẫu đã hoàn thành sang run mới.
 
 ```bash
-bash scripts/resume_rubric_run.sh RUN_ID_CU --retry-into rubric-retry-v1
+bash scripts/resume_rubric_run.sh rubric-600-simple-v1 --retry-into rubric-retry-v1
 ```
 
-Helper khôi phục SHA, input, `LIMIT` và model từ run cũ. Pipeline kiểm tra lại rubric đã được duyệt rồi nhập vào run mới và chỉ gọi API cho các mẫu chưa hoàn thành trong phạm vi `LIMIT` đã lưu. Nếu ngắt run mới, dùng `bash scripts/resume_rubric_run.sh rubric-retry-v1`. Giữ thư mục run nguồn để kiểm tra checksum khi resume.
+Mặc định lệnh trên dùng hai file mới trong `$OUTPUT_DIR/rubric-retry-v1-final/`. Có thể đặt `FINAL_APPLICATION_JSONL` và `FINAL_ISSUE_SPOTTING_JSONL` khi gọi lệnh để chọn cặp đường dẫn mới. Giữ checkpoint nguồn để có thể resume run mới. Với checkpoint rubric v1/v2, dùng `generate_rubrics.sh` và `RUN_ID` mới.
 
-Trong `errors.jsonl`, `metadata.failed_stage` và `metadata.retry_stages` cho biết bước sai và bước được chạy lại. Lỗi mapping sửa trên bản nháp và giữ nguyên decomposition hợp lệ. Audit chỉ yêu cầu phân rã lại khi cần sửa unit; phần phản hồi về mapping được chuyển tiếp sang lượt map tiếp theo. `verdict_source_ids` dùng ID đoạn nguồn `S…`. Nếu model trả ID unit `U…` đã có, Python đối chiếu sang các đoạn nguồn của unit và đưa kết quả cho audit. Issue có review toàn phần vẫn lưu đánh giá criterion hợp lệ, nhưng điểm Application và Outcome của issue đó để trống.
+| File trong thư mục run | Nội dung |
+| --- | --- |
+| `rubric_generation_summary.json` | Tổng mẫu hoàn thành, lỗi, số issues, criteria, issues bổ sung và danh sách mẫu còn thiếu. Full run đạt yêu cầu khi `completed=600`, `failed=0` và `status=completed`. |
+| `added_issues.jsonl` | Issue đã được thêm, lý do và tóm tắt nhận định tương ứng. |
+| `rubric_warnings.jsonl` | Các ghi chú khi sinh rubric để kiểm tra sau. |
+| `errors.jsonl` | Các lỗi API hoặc cấu trúc sau khi hết lượt retry. `metadata.validation_errors` mô tả lỗi cấu trúc theo lần thử. |
 
-Mỗi mẫu có bốn lượt gọi khi không cần retry gồm phân rã, ánh xạ, đọc nguồn độc lập và đối chiếu ngữ nghĩa trong bước audit. Bước Python xác minh evidence nguyên văn, đơn vị nguồn, ID, thứ tự và phạm vi. Các nhóm nhận định tham khảo [Điều 260 Bộ luật Tố tụng hình sự 2015](https://vanban.chinhphu.vn/default.aspx?docid=183217&pageid=27160), [Điều 266 Bộ luật Tố tụng dân sự 2015](https://vanban.chinhphu.vn/?classid=1&docid=183189&pageid=27160&typegroupid=3) và [Điều 194 Luật Tố tụng hành chính 2015](https://vanban.chinhphu.vn/default.aspx?docid=183190&pageid=27160). Category và cấp xét xử dùng trong quá trình sinh rubric. Cả năm category đã xuất hiện trong file mẫu. Category chưa hỗ trợ gây lỗi validation có số dòng.
-
-Trong run sinh rubric, xem `rubric_generation_summary.json` để biết số mẫu hoàn thành, lỗi và những `doc_name` còn thiếu. `rubric_coverage_report.json` đếm các mệnh đề trong danh mục đọc độc lập theo mapped/excluded/missing/unverified và số mẫu chưa đối chiếu được. Chỉ báo tỷ lệ mapped trên tổng mệnh đề trong phạm vi khi mọi mẫu đã qua audit. Tỷ lệ này là kết quả của audit ngữ nghĩa và được báo riêng với trạng thái xuất benchmark. `source_units.jsonl`, `added_issues.jsonl` và `excluded_units.jsonl` lưu nguồn và quyết định ánh xạ. `rubric_review.jsonl` lưu thiếu hụt input, verdict chưa xác định và lỗi sinh rubric. Issue gốc chưa có nhận định hỗ trợ được giữ cùng lý do review và danh sách nhóm rỗng.
-
-`rubric_review.jsonl` là log để đối chiếu sau khi chạy. Dòng có `review_status=added_issue` ghi issue mới đã qua audit và bằng chứng. Dòng có `review_status=needs_review` ghi issue hoặc criterion cần xem lại, lý do và cờ loại khỏi Application Score. Khi run đã xuất đủ file nhưng còn ghi chú, summary báo `completed_with_review` và `published=true`. Với checkpoint từ trước phiên bản có danh mục mệnh đề độc lập, tạo run mới bằng `generate_rubrics.sh` và `RESUME=0`.
-
-Trong run đánh giá, `generations.jsonl` lưu nguyên văn câu trả lời. `evaluations.jsonl` lưu từng criterion, bằng chứng trích từ câu trả lời, điểm issue và Outcome Accuracy. Application Score lấy trung bình các issue đủ điều kiện, rồi lấy trung bình các sample đủ điều kiện. Outcome Accuracy có mẫu số riêng. Issue có thiếu hụt quyết định được loại khỏi điểm chính. Điểm của các criterion còn đủ căn cứ vẫn có trong chi tiết. `summary.json` báo hai metric cùng số mẫu và issue review theo category.
+Trong run đánh giá, `generations.jsonl` lưu câu trả lời và `evaluations.jsonl` lưu kết quả chấm. Judge chấm từng tiêu chí theo nội dung pháp lý. Application Score lấy trung bình các tiêu chí trong issue, các issue trong sample rồi các sample trong run. Outcome Accuracy chỉ dùng những issue có `reference_verdict`. File App rubric v3 dùng trực tiếp với `run_application.sh`. File rubric v2 đã xuất trước đây vẫn cần manifest đi kèm.
 
 ## Hướng dẫn chuẩn bị dữ liệu và đánh giá legacy
 

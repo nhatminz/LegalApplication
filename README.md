@@ -1,8 +1,8 @@
 # Legal Application Benchmark
 
-Pipeline mặc định đánh giá Rule Application theo rubric riêng của từng issue. Chạy `scripts/generate_rubrics.sh` để sinh dataset Application và gold Issue Spotting đồng bộ. Sau đó dùng `scripts/run_application.sh` để kiểm tra dataset, sinh câu trả lời và chấm từng criterion. Python báo Application Score và Outcome Accuracy độc lập.
+Pipeline mặc định đánh giá Rule Application theo rubric riêng của từng issue. Chạy `scripts/generate_rubrics.sh` để sinh rubric và ghi ngay từng mẫu thành công vào dataset Application và gold Issue Spotting đồng bộ. Sau đó dùng `scripts/run_application.sh` để kiểm tra dataset, sinh câu trả lời và chấm từng criterion. Python báo Application Score và Outcome Accuracy độc lập.
 
-Các lệnh chạy 10 mẫu trên RTX 3090, chạy 600 mẫu trên B200, judge-only và resume nằm ở đầu [HUONG_DAN_CHAY.md](HUONG_DAN_CHAY.md).
+Các lệnh chạy thử 10 mẫu, chạy 600 mẫu trên B200, judge-only và resume nằm ở đầu [HUONG_DAN_CHAY.md](HUONG_DAN_CHAY.md).
 
 Các mục lịch sử dưới đây dùng `EVALUATION_PROFILE=legacy` khi gọi `run_application.sh` với dataset bản án gốc hoặc đọc điểm LEGIT. Các script `statistic.sh`, `filter_full.sh` và `create_task_inputs.sh` vẫn phục vụ bước chuẩn bị dữ liệu.
 

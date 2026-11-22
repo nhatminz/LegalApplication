@@ -7,7 +7,7 @@ from statistics import mean
 from jsonschema import Draft202012Validator
 
 from .data import Sample
-from .rubrics import criteria_for, issue_blocked, load_schema, require_schema
+from .rubrics import RUBRIC_PROTOCOL, criteria_for, issue_blocked, load_schema, require_schema
 
 LABEL_SCHEMA = json.loads(files("legal_application").joinpath("schemas", "judge_labels.schema.json").read_text())
 VALIDATOR = Draft202012Validator(LABEL_SCHEMA)
@@ -71,19 +71,21 @@ RUBRIC_JUDGE_SCHEMA = load_schema("rubric_judge")
 
 
 def evaluation_plan(sample: Sample) -> dict:
+    rubric = sample.raw["rubrics"]
+    simple = rubric["version"] == RUBRIC_PROTOCOL
     issues = []
-    for issue in sample.raw["rubrics"]["issues"]:
+    for issue in rubric["issues"]:
         criteria = criteria_for(issue)
-        blocked = issue_blocked(issue)
-        eligible = [c["criterion_id"] for c in criteria if c["scorable"]]
-        status = "needs_review" if blocked or any(c["needs_review"] for c in criteria) or not eligible else "scored"
+        blocked = not simple and issue_blocked(issue)
+        eligible = [c["criterion_id"] for c in criteria if simple or c["scorable"]]
+        status = "needs_review" if blocked or any(c.get("needs_review") for c in criteria) or not eligible else "scored"
         if not criteria:
             status = "unscorable"
-        outcome = issue["reference_verdict"] is not None and not blocked
+        outcome = issue.get("reference_verdict") is not None and not blocked
         issues.append({"issue_index": issue["issue_index"], "evaluation_status": status,
                        "criterion_ids": eligible, "application_scorable": bool(eligible) and not blocked,
                        "outcome_scorable": outcome})
-    review = any(row["evaluation_status"] != "scored" or not row["outcome_scorable"] for row in issues)
+    review = not simple and any(row["evaluation_status"] != "scored" or not row["outcome_scorable"] for row in issues)
     return {"issues": issues, "needs_review": review}
 
 
@@ -103,6 +105,7 @@ def score_rubric_labels(labels: dict, sample: Sample, answer: str) -> dict:
             "needs_review" if plan["needs_review"] else "completed"):
         raise LabelError("Judge sample review status does not match the evaluation plan")
     issue_results = []
+    simple = sample.raw["rubrics"]["version"] == RUBRIC_PROTOCOL
     for row, planned in zip(rows, planned_issues):
         issue = planned["issue_index"]
         if row["issue_index"] != issue or row["evaluation_status"] != planned["evaluation_status"]:
@@ -115,7 +118,8 @@ def score_rubric_labels(labels: dict, sample: Sample, answer: str) -> dict:
             if type(item["score"]) is not int:
                 raise LabelError(f"{item['criterion_id']}: score must be integer 0, 1 or 2")
             evidence = item["evidence_from_model_answer"]
-            if (item["score"] > 0 and not evidence) or any(not quote.strip() or quote not in answer for quote in evidence):
+            if not simple and ((item["score"] > 0 and not evidence)
+                               or any(not quote.strip() or quote not in answer for quote in evidence)):
                 raise LabelError(f"{item['criterion_id']}: cite a short verbatim excerpt of the model answer")
             if not item["explanation"].strip():
                 raise LabelError(f"{item['criterion_id']}: missing explanation")

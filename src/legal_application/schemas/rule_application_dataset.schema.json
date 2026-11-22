@@ -73,6 +73,122 @@
       "minLength": 1
     },
     "rubrics": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/issueRubrics"
+        },
+        {
+          "$ref": "#/$defs/legacyRubrics"
+        }
+      ]
+    }
+  },
+  "required": [
+    "input",
+    "expected_answer",
+    "doc_name",
+    "category",
+    "rubrics"
+  ],
+  "$defs": {
+    "issueRubrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "const": 3
+        },
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "issue_index": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "issue_text": {
+                "type": "string",
+                "minLength": 1
+              },
+              "groups": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "group_id": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "group_name": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "criteria": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                          "criterion_id": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "description": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "reference_reasoning": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        },
+                        "required": [
+                          "criterion_id",
+                          "description",
+                          "reference_reasoning"
+                        ]
+                      },
+                      "minItems": 1
+                    }
+                  },
+                  "required": [
+                    "group_id",
+                    "group_name",
+                    "criteria"
+                  ]
+                },
+                "minItems": 1
+              },
+              "reference_verdict": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "issue_index",
+              "issue_text",
+              "groups"
+            ]
+          },
+          "minItems": 1
+        }
+      },
+      "required": [
+        "version",
+        "issues"
+      ]
+    },
+    "legacyRubrics": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -307,12 +423,5 @@
         "issues"
       ]
     }
-  },
-  "required": [
-    "input",
-    "expected_answer",
-    "doc_name",
-    "category",
-    "rubrics"
-  ]
+  }
 }

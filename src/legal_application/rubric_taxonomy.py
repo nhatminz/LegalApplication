@@ -69,13 +69,6 @@ CATEGORY_ALIASES = {
     "hngđ": "Marriage & Family", "labour": "Labor", "lao động": "Labor", "hành chính": "Administrative",
 }
 
-PROCEDURAL_ANCHORS = {
-    "Criminal": "điểm d khoản 2 Điều 260 Bộ luật Tố tụng hình sự 2015",
-    "Administrative": "điểm b khoản 2 Điều 194 Luật Tố tụng hành chính 2015",
-}
-CIVIL_ANCHOR = "điểm b khoản 2 Điều 266 Bộ luật Tố tụng dân sự 2015"
-
-
 def canonical_category(value: str) -> str:
     if not isinstance(value, str) or value.strip().casefold() not in CATEGORY_ALIASES:
         raise ValueError(f"Unsupported category {value!r}")

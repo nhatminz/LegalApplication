@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
-from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,606 +9,317 @@ import httpx
 import pytest
 
 from conftest import envelope, make_record
-from legal_application.config import Config
 from legal_application.data import DatasetError
 from legal_application.pipeline import Pipeline
-from legal_application.rubric_builder import RubricPipeline, stage_messages
-from legal_application.rubric_taxonomy import TAXONOMY, canonical_category
-from legal_application.rubrics import DECOMPOSITION_SCHEMA, materialize, raw_rubric_sample, rubric_sample, source_segments
+from legal_application.rubric_builder import RubricPipeline
+from legal_application.rubrics import criteria_for, rubric_sample
 from legal_application.scoring import LabelError, evaluation_plan, score_rubric_labels
-from legal_application.storage import read_jsonl
+from legal_application.storage import atomic_json, atomic_jsonl, file_hash, read_jsonl
+from legal_application.rubric_taxonomy import TAXONOMY
 
 ANSWER = "B ký nhận nợ. Do đó B phải trả 100 đồng."
-WORDS = "Việc B xác nhận khoản nợ làm phát sinh nghĩa vụ hoàn trả đủ một trăm đồng."
+REASONING = "Việc B xác nhận khoản nợ làm phát sinh nghĩa vụ hoàn trả đủ một trăm đồng."
 
 
-def raw_record(doc="case-1", category="Civil"):
-    raw = make_record(doc, n=1)
+def raw_record(doc="case-1", category="Civil", n=1):
+    raw = make_record(doc, n)
     raw.update(category=category, instance_level="First-instance", code="DS-ST")
     raw["benchmark_seed"]["application"] = ANSWER
     return raw
 
 
-def artifacts(raw, *, add=False, missing=False):
-    sample = raw_rubric_sample(raw, 0)
-    group = list(TAXONOMY[canonical_category(raw["category"])])[0]
-    source = source_segments(sample.raw["expected_answer"], "S")
-    unit_rows = [
-        {"unit_id": "U1", "reasoning": "B chịu nghĩa vụ trả nợ", "source_ids": list(source)},
-        {"unit_id": "U2", "reasoning": "Thông báo về án phí thường lệ", "source_ids": list(source)},
-    ]
-    assignment = {"unit_id": "U1", "issue_index": 1, "group_id": group, "other_group_name": None,
-                  "criterion": "Nối tình tiết nhận nợ với nghĩa vụ trả nợ",
-                  "relevant_fact_ids": ["F1"] if not missing else [], "rule_indices": [1],
-                  "missing_information": ["Giấy xác nhận nợ"] if missing else [],
-                  "review_reason": "facts_clean chưa thể hiện giấy xác nhận nợ" if missing else None,
-                  "decisive": missing}
-    outcome = {"issue_index": 1, "reference_verdict": "B phải trả 100 đồng", "verdict_source_ids": ["S1"],
-               "outcome_review_reason": None, "issue_review_reason": "Thiếu tình tiết quyết định" if missing else None}
-    plan = {"added_issues": [], "assignments": [assignment], "issues": [outcome],
-            "excluded_units": [{"unit_id": "U2", "exclusion_reason": "Chỉ là án phí thường lệ, không làm đổi kết quả"}]}
-    if add:
-        unit_rows.append({"unit_id": "U3", "reasoning": "Hệ quả của một yêu cầu độc lập", "source_ids": ["S1"]})
-        plan["added_issues"].append({"issue_text": "Có chấp nhận yêu cầu độc lập?", "unit_ids": ["U3"],
-                                     "reason": "Gold issue chỉ nói về nghĩa vụ trả nợ"})
-        plan["assignments"].append({**assignment, "unit_id": "U3", "issue_index": 2, "criterion": "Giải quyết yêu cầu độc lập"})
-        plan["issues"].append({**outcome, "issue_index": 2})
-    for unit in unit_rows:
-        unit.update(reasoning_type="fact_to_rule_application" if unit["unit_id"] == "U1" else "legal_consequence",
-                    group_id=group, group_rationale=None,
-                    evidence=[{"source_id": sid, "quote": source[sid].strip()} for sid in unit["source_ids"]])
-    for row in plan["assignments"]:
-        row.update(group_adjustment_reason=None, legal_condition="Có nghĩa vụ trả khoản nợ đã xác nhận",
-                   application_link="Việc xác nhận khoản nợ làm phát sinh nghĩa vụ hoàn trả")
-    for proposed in plan["added_issues"]:
-        proposed["why_existing_issues_do_not_cover"] = "Issue về khoản nợ không giải quyết yêu cầu độc lập này."
-    return sample, {"units": unit_rows, "non_reasoning": []}, plan
+def settings(config_factory, records=None, **changes):
+    config = config_factory(records or [raw_record()], mode="build-rubrics", evaluation_profile="rubric")
+    return replace(config, final_application_jsonl=config.project_root / "application.jsonl",
+                   final_issue_spotting_jsonl=config.project_root / "spotting.jsonl", **changes)
 
 
-def fixture_inventory(dec):
-    return {"propositions": [{**unit, "unit_id": "P" + unit["unit_id"][1:]} for unit in dec["units"]],
-            "non_reasoning": dec["non_reasoning"]}
+def model_output(payload, *, group_id=None):
+    chosen = group_id or next(iter(payload["taxonomy"]))
+    criterion = {"description": "Giải thích nghĩa vụ trả khoản nợ đã xác nhận", "reference_reasoning": REASONING}
+    return {"issues": [{"issue_index": issue["issue_index"], "groups": [{"group_id": chosen, "criteria": [criterion]}],
+                        "reference_verdict": "B phải hoàn trả 100 đồng"} for issue in payload["gold_issues"]]}
 
 
-def fixture_audit(dec, plan, *, stage=None, problems=()):
-    mapped = {r["unit_id"] for r in plan["assignments"]}
-    return {"approved": stage is None, "repair_stage": stage, "problems": list(problems), "additional_propositions": [],
-            "coverage": [{"proposition_id": "P" + unit["unit_id"][1:],
-                          "status": "mapped" if unit["unit_id"] in mapped else "excluded",
-                          "unit_id": unit["unit_id"], "reason": "Đã đối chiếu theo phạm vi."}
-                         for unit in dec["units"]]}
+def request_payload(request):
+    body = json.loads(request.content)
+    return body, json.loads(body["messages"][1]["content"])
 
 
-def request_stage(schema):
-    return next(name for field, name in [("units", "decompose"), ("assignments", "map"),
-                                         ("propositions", "inventory"), ("coverage", "audit")] if field in schema)
+def response(value, *, fence=False):
+    content = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    if fence:
+        content = "```json\n" + content + "\n```"
+    return httpx.Response(200, json=envelope(content))
 
 
-def run_build(config, handler):
+def build(config, handler):
     return asyncio.run(RubricPipeline(config, rubric_transport=httpx.MockTransport(handler)).run())
 
 
-def run_eval(config, generator, judge):
-    return asyncio.run(Pipeline(config, generator_transport=httpx.MockTransport(generator),
-                                judge_transport=httpx.MockTransport(judge)).run())
+def verify_pair(config, expected_count):
+    application = read_jsonl(config.final_application_jsonl)
+    spotting = read_jsonl(config.final_issue_spotting_jsonl)
+    assert len(application) == len(spotting) == expected_count
+    assert len({r["doc_name"] for r in application}) == expected_count
+    for i, (app, spot) in enumerate(zip(application, spotting)):
+        rubric_sample(app, i)
+        assert spot == {"input": app["input"]["facts_clean"], "expected_answer": app["input"]["issues"]}
+    return application
 
 
-def judge_result(row, score=2, outcome=True, evidence=WORDS):
-    sample = rubric_sample(row, 0)
-    plan = evaluation_plan(sample)
-    return {"doc_name": row["doc_name"], "category": row["category"], "needs_review": plan["needs_review"],
-            "evaluation_status": "needs_review" if plan["needs_review"] else "completed",
-            "issues_evaluation": [{"issue_index": issue["issue_index"], "evaluation_status": issue["evaluation_status"],
-                                   "criterion_scores": [{"criterion_id": cid, "score": score,
-                                                         "evidence_from_model_answer": [evidence] if score else [],
-                                                         "explanation": "Đánh giá theo ý nghĩa pháp lý."}
-                                                        for cid in issue["criterion_ids"]],
-                                   "outcome_correct": outcome if issue["outcome_scorable"] else None,
-                                   "outcome_explanation": "Kết quả và lý do đủ điều kiện theo rubric."}
-                                  for issue in plan["issues"]]}
-
-
-@pytest.mark.parametrize("category", list(TAXONOMY))
-def test_taxonomy_and_exact_raw_projection(category):
-    raw = raw_record(category=category)
-    raw["benchmark_seed"]["facts_clean"] += "\n giữ khoảng trắng "
-    sample, decomposition, plan = artifacts(raw)
-    record, audit = materialize(sample, decomposition, plan)
-    assert record["category"] == raw["category"]
-    assert record["input"]["issues"] == raw["issues"]
-    assert record["input"]["facts_clean"] == raw["benchmark_seed"]["facts_clean"]
-    assert record["expected_answer"] == ANSWER
-    assert record["input"]["rules"][-1] == {"law_str": "Văn bản toàn văn", "citation_str": None,
-                                           "context_text": "Toàn bộ văn bản fallback."}
-    assert record["rubrics"]["issues"][0]["groups"][0]["group_name"] in TAXONOMY[category].values()
-    assert len(audit["mapping"]) == 1 and audit["excluded_units"][0]["source_evidence"] == [ANSWER]
-
-
-@pytest.mark.parametrize("change", ["category", "unaccounted", "unmapped", "twice", "wrong_group", "invented_evidence", "unnecessary_added", "wrong_order", "unsupported_rule"])
-def test_rubric_validation_rejects_inconsistent_source_and_mapping(change):
-    raw = raw_record()
-    sample, decomposition, plan = artifacts(raw, add=change == "unnecessary_added")
-    if change == "category":
-        raw["category"] = "Unsupported"
-        with pytest.raises(ValueError, match="Unsupported category"):
-            raw_rubric_sample(raw, 0)
-        return
-    if change == "unaccounted":
-        decomposition["units"].clear()
-    if change == "unmapped":
-        plan["excluded_units"].clear()
-    if change == "twice":
-        plan["excluded_units"][0]["unit_id"] = "U1"
-    if change == "wrong_group":
-        plan["assignments"][0]["group_id"] = "offense"
-    if change == "invented_evidence":
-        decomposition["units"][0]["source_ids"] = ["S999"]
-    if change == "unnecessary_added":
-        plan["added_issues"][0]["issue_text"] = raw["issues"][0]
-    if change == "wrong_order":
-        plan["issues"][0]["issue_index"] = 2
-    if change == "unsupported_rule":
-        plan["assignments"][0]["rule_indices"] = [999]
-    with pytest.raises(ValueError):
-        materialize(sample, decomposition, plan)
-
-
-def test_build_retry_resume_paired_publish_and_evaluate(config_factory, tmp_path):
-    originals = [raw_record("first"), raw_record("second", "Commercial")]
-    originals[1]["code"] = "KDTM-ST"
-    application = tmp_path / "final/application.jsonl"
-    spotting = tmp_path / "final/spotting.jsonl"
-    config = config_factory(originals, mode="build-rubrics", expected_count=2, rubric_json_retries=0,
-                            final_application_jsonl=application, final_issue_spotting_jsonl=spotting)
+def test_one_call_direct_final_auto_add_and_warnings(config_factory):
+    raw = raw_record(category="Commercial", n=2)
+    original = raw["issues"]
+    config = settings(config_factory, [raw, raw_record("later")], batch_size=1, expected_count=2)
     raw_bytes = config.input_jsonl.read_bytes()
     calls = []
-    reject_second = True
 
-    def rubric(request):
-        body = json.loads(request.content)
+    def handler(request):
+        body, payload = request_payload(request)
+        calls.append(payload)
         assert body["model"] == config.rubric_model
-        assert body["chat_template_kwargs"]["reasoning_effort"] == 75
-        assert body["max_tokens"] == 65536
-        payload = json.loads(body["messages"][1]["content"])
-        raw = next(r for r in originals if r["category"] == payload["category"])
-        assert payload["instance_level"] == raw["instance_level"]
-        assert "".join(payload["expected_answer_segments"].values()) == ANSWER
-        schema = body["response_format"]["json_schema"]["schema"]["properties"]
-        _, dec, plan = artifacts(raw, add=raw["doc_name"] == "first", missing=raw["doc_name"] == "second")
-        stage = request_stage(schema)
-        calls.append((raw["doc_name"], stage))
-        approved = not (reject_second and raw["doc_name"] == "second")
-        if stage == "audit":
-            assert payload["plan"] == plan
-        if stage == "inventory":
-            assert not {"decomposition", "plan", "issues"} & payload.keys()
-        value = {"decompose": dec, "map": plan, "inventory": fixture_inventory(dec),
-                 "audit": fixture_audit(dec, plan, stage=None if approved else "map",
-                                        problems=[] if approved else ["Unit U2 excluded without adequate reasoning"])}[stage]
-        return httpx.Response(200, json=envelope(json.dumps(value, ensure_ascii=False)))
+        assert body["chat_template_kwargs"] == {"thinking": True, "reasoning_effort": 75}
+        assert body["response_format"]["type"] == "json_schema"
+        assert payload["expected_answer"] == ANSWER
+        assert set(payload) == {"expected_answer", "gold_issues", "facts_clean", "rules", "category", "taxonomy"}
+        if len(calls) == 2:
+            verify_pair(config, 1)
+            return response(model_output(payload))
+        assert payload["category"] == "Commercial" and "contract" in payload["taxonomy"]
+        result = model_output(payload, group_id="nhom-tu-de-xuat")
+        result["issues"].reverse()
+        result["issues"][1]["warnings"] = ["Cần đọc lại căn cứ tính lãi"]
+        result["added_issues"] = [
+            {"issue_text": original[0], "reason": "Trùng", "groups": []},
+            {"issue_text": "Yêu cầu bồi thường độc lập được giải quyết thế nào?", "reason": "Ảnh hưởng kết quả riêng",
+             "groups": [{"group_id": "remedies", "criteria": [{"description": "Phân tích yêu cầu độc lập", "reference_reasoning": "Bác bồi thường"}]}]},
+        ]
+        return response(result, fence=True)
 
-    first = run_build(config, rubric)
-    assert first["counts"]["failed"] == 1 and first["missing_doc_names"] == ["second"]
-    assert not first["published"] and not application.exists() and not spotting.exists()
-    assert "audit rejected" in read_jsonl(config.run_dir / "rubric_review.jsonl")[-1]["error"]
-    calls.clear()
-    reject_second = False
-    complete = run_build(replace(config, resume=True), rubric)
-    assert calls == [("second", stage) for stage in ("decompose", "map", "inventory", "audit")]
-    assert complete["status"] == "completed_with_review" and complete["counts"]["skipped"] == 1
-    assert complete["published"] and complete["counts"]["added_issues"] == 1
-    assert not (config.run_dir / "issue_decisions.jsonl").exists()
-    draft = read_jsonl(config.run_dir / "rule_application_draft.jsonl")[0]
-    with pytest.raises(ValueError, match="Draft rubric dataset"):
-        rubric_sample(draft, 0)
-    assert complete["counts"]["issues_needing_review"] == 1
-    assert complete["counts"]["samples_with_added_issues"] == 1
-    assert complete["counts"]["rubric_coverage"] == 1
+    summary = build(config, handler)
+    assert summary["status"] == "completed"
+    assert summary["counts"]["completed"] == 2
+    assert summary["counts"]["criteria"] == summary["counts"]["issues"] == 4
+    assert len(calls) == summary["counts"]["api_calls"] == 2
+    assert summary["counts"]["failed"] == 0 and summary["counts"]["added_issues"] == 1
     assert config.input_jsonl.read_bytes() == raw_bytes
-    rows = read_jsonl(application)
-    spots = read_jsonl(spotting)
-    assert [row["doc_name"] for row in rows] == ["first", "second"]
-    assert spots == [{"input": row["input"]["facts_clean"], "expected_answer": row["input"]["issues"]} for row in rows]
-    added = read_jsonl(config.run_dir / "added_issues.jsonl")
-    assert added[0]["status"] == "audit_accepted"
-    assert added[0]["new_issue"] == spots[0]["expected_answer"][-1] and added[0]["doc_name"] == "first"
-    notes = read_jsonl(config.run_dir / "rubric_review.jsonl")
-    assert notes[0] == {**added[0], "review_status": "added_issue"}
-    assert notes[1]["review_status"] == "needs_review" and notes[1]["doc_name"] == "second"
-    assert notes[1]["excluded_from_application_score"] is True
-    assert len(read_jsonl(config.run_dir / "excluded_units.jsonl")) == 2
-    assert len(read_jsonl(config.run_dir / "source_units.jsonl")) == 2
-    manifest = json.loads(application.with_name(application.name + ".manifest.json").read_text())
-    assert manifest["sample_count"] == 2 and manifest["verification"] == "semantic_audit"
-    assert "issue_decisions" not in manifest
-
-    accessed = []
-    def generate(request):
-        body = json.loads(request.content)
-        assert "Fact-to-Rule Application" in body["messages"][0]["content"]
-        assert "tự chọn bố cục" in body["messages"][0]["content"]
-        prompt = body["messages"][1]["content"]
-        assert {"response_format", "rubrics", "category", "doc_name", "expected_answer"}.isdisjoint(body)
-        assert all(secret not in prompt for secret in [ANSWER, "Commercial", "Civil", "first", "second", "I1_C1"])
-        accessed.append("generator")
-        return httpx.Response(200, json=envelope(WORDS))
-
-    def judge(request):
-        body = json.loads(request.content)
-        payload = json.loads(body["messages"][1]["content"])
-        assert "expected_answer" not in payload and "benchmark_seed" not in payload
-        assert "theo ý nghĩa pháp lý" in body["messages"][0]["content"]
-        assert payload["evaluated_model_response"] == WORDS
-        row = next(row for row in rows if row["doc_name"] == payload["doc_name"])
-        assert payload["rubrics"] == row["rubrics"]
-        accessed.append("judge")
-        return httpx.Response(200, json=envelope(json.dumps(judge_result(row, outcome=False), ensure_ascii=False)))
-
-    def forbidden(_request):
-        pytest.fail("Unexpected model call")
-
-    evaluation = replace(config, mode="full", evaluation_profile="rubric", input_jsonl=application, run_id="evaluate")
-    summary = run_eval(evaluation, generate, judge)
-    assert accessed.count("generator") == accessed.count("judge") == 2
-    assert summary["application_score"] == 1 and summary["outcome_accuracy"] == 0
-    assert summary["by_category"]["Commercial"]["unscorable_samples"] == 1
-    assert summary["by_category"]["Civil"]["application_scored_samples"] == 1
-    assert "final_order" not in json.dumps(summary)
-    generations = read_jsonl(evaluation.run_dir / "generations.jsonl")
-    assert all(r["raw_response"] == WORDS and r["run_id"] == evaluation.run_id for r in generations)
-    resumed = run_eval(replace(evaluation, resume=True), forbidden, forbidden)
-    assert resumed["counts"]["skipped"] == 2 and resumed["application_score"] == 1
-    judge_only = replace(evaluation, mode="judge-only", run_id="judge-only",
-                         generation_jsonl=evaluation.run_dir / "generations.jsonl")
-    assert run_eval(judge_only, forbidden, judge)["outcome_accuracy"] == 0
+    app, _ = verify_pair(config, 2)
+    assert app["input"]["issues"][:2] == original
+    assert app["rubrics"].keys() == {"version", "issues"}
+    assert app["expected_answer"] == ANSWER
+    first, second, added = app["rubrics"]["issues"]
+    assert [c["criterion_id"] for issue in [first, second, added] for c in criteria_for(issue)] == ["I1_C1", "I2_C1", "I3_C1"]
+    assert first["groups"][0]["group_id"] == "other_1"
+    criterion = criteria_for(first)[0]
+    assert set(criterion) == {"criterion_id", "description", "reference_reasoning"}
+    assert criterion["reference_reasoning"] not in ANSWER
+    log = read_jsonl(config.run_dir / "added_issues.jsonl")
+    assert len(log) == 1 and log[0]["issue_text"] == app["input"]["issues"][-1]
+    assert log[0]["reference_reasoning"] == ["Bác bồi thường"]
+    assert read_jsonl(config.run_dir / "rubric_warnings.jsonl")
+    assert not (config.run_dir / "rule_application_draft.jsonl").exists()
 
 
-def test_application_score_macro_averages_issues_and_keeps_outcome_separate():
-    sample, dec, plan = artifacts(raw_record(), add=True)
-    for i in range(2):
-        # Two more separate criteria with source evidence supporting the second issue.
-        uid = f"EX{i}"
-        dec["units"].append({"unit_id": uid, "reasoning": f"Lập luận {i}", "source_ids": ["S1"]})
-        plan["assignments"].append({**plan["assignments"][-1], "unit_id": uid, "criterion": f"Tiêu chí {i}"})
-        plan["added_issues"][0]["unit_ids"].append(uid)
-    row, _ = materialize(sample, dec, plan)
-    sample = rubric_sample(row, 0)
-    labels = judge_result(row)
-    second = labels["issues_evaluation"][1]
-    for rating in second["criterion_scores"]:
-        rating.update(score=0, evidence_from_model_answer=[])
-    second["outcome_correct"] = False
-    result = score_rubric_labels(labels, sample, WORDS)
-    assert result["application_score"] == 0.5 and result["application_score_10"] == 5
-    assert result["outcome_accuracy"] == 0.5
-    assert [row["scored_criteria"] for row in result["issues"]] == [1, 3]
-    for mutate in [lambda value: value["issues_evaluation"][1]["criterion_scores"].pop(),
-                   lambda value: value["issues_evaluation"][0]["criterion_scores"][0].update(score=3),
-                   lambda value: value["issues_evaluation"][0]["criterion_scores"][0].update(evidence_from_model_answer=["invented"])]:
-        bad = deepcopy(labels)
-        mutate(bad)
-        with pytest.raises(LabelError):
-            score_rubric_labels(bad, sample, WORDS)
-
-
-def test_decisively_missing_input_and_unclear_verdict_never_receive_zero():
-    sample, dec, plan = artifacts(raw_record(), missing=True)
-    plan["issues"][0].update(reference_verdict=None, verdict_source_ids=[], outcome_review_reason="Nguồn không có kết luận.")
-    row, _ = materialize(sample, dec, plan)
-    labels = judge_result(row)
-    result = score_rubric_labels(labels, rubric_sample(row, 0), WORDS)
-    assert result["application_score"] is None and result["outcome_accuracy"] is None and labels["needs_review"]
-    assert labels["issues_evaluation"][0]["criterion_scores"] == []
-
-
-def test_decisively_blocked_issue_keeps_scores_of_other_valid_criteria():
-    sample, dec, plan = artifacts(raw_record(), missing=True)
-    row, _ = materialize(sample, dec, plan)
-    issue = row["rubrics"]["issues"][0]
-    criterion = deepcopy(issue["groups"][0]["criteria"][0])
-    criterion.update(criterion_id="I1_C2", unit_id="U3", criterion="Xác định phạm vi nghĩa vụ",
-                     scorable=True, needs_review=False, decisive=False, missing_information=[], review_reason=None)
-    issue["groups"][0]["criteria"].append(criterion)
-    sample = rubric_sample(row, 0)
-    labels = judge_result(row, score=1)
-    assert labels["issues_evaluation"][0]["criterion_scores"][0]["criterion_id"] == "I1_C2"
-    scores = score_rubric_labels(labels, sample, WORDS)
-    assert scores["application_score"] is None
-    assert scores["issues"][0]["scored_criteria"] == 1
-
-
-def test_review_reason_kept_when_grounded_criteria_cover_only_part_of_issue():
-    sample, dec, plan = artifacts(raw_record())
-    plan["issues"][0]["issue_review_reason"] = "Nguồn giải quyết một phần và chưa đủ căn cứ cho toàn issue."
-    row, _ = materialize(sample, dec, plan)
-    labels = judge_result(row)
-    assert labels["issues_evaluation"][0]["criterion_scores"][0]["criterion_id"] == "I1_C1"
-    result = score_rubric_labels(labels, rubric_sample(row, 0), WORDS)
-    assert result["application_score"] is None and result["outcome_accuracy"] is None
-
-
-@pytest.mark.parametrize("repair_stage", ["map", "decompose"])
-def test_rubric_repair_uses_verified_source_ids_and_retries_only_required_stage(config_factory, tmp_path, repair_stage):
-    raw = raw_record("recovery")
-    raw["benchmark_seed"]["application"] = ANSWER + "\n" + "Nội dung khác để tạo đoạn nguồn. " * 30
-    _, dec, plan = artifacts(raw, missing=True)
-    plan["issues"][0].update(issue_review_reason=None, verdict_source_ids=["U1", "S1"])
-    config = config_factory([raw], mode="build-rubrics", expected_count=1, rubric_json_retries=2,
-                            final_application_jsonl=tmp_path / "application.jsonl",
-                            final_issue_spotting_jsonl=tmp_path / "spotting.jsonl")
+@pytest.mark.parametrize("bad", ["{invalid", {"issues": []}, {"issues": [{"issue_index": 1, "groups": []}]}])
+def test_retry_recovers_invalid_json_or_missing_rubric(config_factory, bad):
+    config = settings(config_factory, rubric_json_retries=1)
     calls = []
 
-    def rubric(request):
-        body = json.loads(request.content)
-        schema = body["response_format"]["json_schema"]["schema"]["properties"]
-        stage = request_stage(schema)
-        system = body["messages"][0]["content"]
-        payload = json.loads(body["messages"][1]["content"])
-        calls.append(stage)
-        if stage in {"map", "audit"}:
-            assert "Án phí, quyền kháng cáo" in system and "input cố định" in system
-        if stage == "decompose":
-            value = dec
-            if calls.count(stage) > 1:
-                assert payload["previous_attempt"] == dec and "Cần sửa U1" in system
-        elif stage == "map":
-            assert payload["decomposition"] == dec
-            assert schema["issues"]["items"]["properties"]["verdict_source_ids"]["items"]["enum"] == list(payload["expected_answer_segments"])
-            value = deepcopy(plan)
-            if calls.count(stage) == 1:
-                value["issues"][0]["verdict_source_ids"] = ["U404"]
-            if calls.count(stage) == 2:
-                assert payload["previous_attempt"]["issues"][0]["verdict_source_ids"] == ["U404"]
-            if calls.count(stage) == 3:
-                assert "Cần sửa U1" in system
-                assert ("previous_attempt" in payload) == (repair_stage == "map")
-        elif stage == "inventory":
-            value = fixture_inventory(dec)
-        else:
-            outcome = payload["plan"]["issues"][0]
-            assert outcome["verdict_source_ids"] == list(payload["expected_answer_segments"])
-            assert outcome["issue_review_reason"] == plan["assignments"][0]["review_reason"]
-            approved = calls.count(stage) > 1
-            value = fixture_audit(dec, plan, stage=None if approved else repair_stage,
-                                  problems=[] if approved else ["Cần sửa U1"])
-        return httpx.Response(200, json=envelope(json.dumps(value, ensure_ascii=False)))
+    def handler(request):
+        body, payload = request_payload(request)
+        calls.append(body)
+        if len(calls) == 1:
+            return response(bad)
+        assert "Kết quả trước chưa đúng cấu trúc" in body["messages"][0]["content"]
+        return response(model_output(payload))
 
-    assert run_build(config, rubric)["published"]
-    assert calls == ["decompose", "map", "map", "inventory", "audit", *(["decompose"] if repair_stage == "decompose" else []), "map", "audit"]
-    saved = read_jsonl(config.run_dir / "rubric_records.jsonl")[0]
-    assert saved["metadata"]["retry_stages"] == [
-        {"failed_stage": "map", "retry_stage": "map"}, {"failed_stage": "audit", "retry_stage": repair_stage}]
-    assert saved["dataset"]["rubrics"]["issues"][0]["verdict_evidence"] == list(source_segments(raw["benchmark_seed"]["application"], "S").values())
+    assert build(config, handler)["counts"]["completed"] == 1
+    assert len(calls) == 2
+    assert read_jsonl(config.run_dir / "rubric_records.jsonl")[0]["metadata"]["validation_errors"]
 
 
-def test_retry_into_new_run_replays_completed_rubric_and_only_calls_failed_sample(config_factory, tmp_path):
-    rows = [raw_record("old-approved"), raw_record("old-failed", "Commercial")]
-    cfg = config_factory(rows, mode="build-rubrics", expected_count=2, rubric_json_retries=0, api_max_retries=0,
-                         final_application_jsonl=tmp_path / "application.jsonl",
-                         final_issue_spotting_jsonl=tmp_path / "spotting.jsonl")
-    seen = []
-    first_run = True
-
-    def judge(request):
-        body = json.loads(request.content)
-        payload = json.loads(body["messages"][1]["content"])
-        seen.append(payload["category"])
-        if first_run and payload["category"] == "Commercial":
-            return httpx.Response(503)
-        _, dec, plan = artifacts(next(row for row in rows if row["category"] == payload["category"]))
-        fields = body["response_format"]["json_schema"]["schema"]["properties"]
-        value = {"decompose": dec, "map": plan, "inventory": fixture_inventory(dec),
-                 "audit": fixture_audit(dec, plan)}[request_stage(fields)]
-        return httpx.Response(200, json=envelope(json.dumps(value, ensure_ascii=False)))
-
-    assert run_build(cfg, judge)["counts"]["completed"] == 1
-    source = cfg.run_dir / "rubric_records.jsonl"
-    original = source.read_bytes()
-    old_snapshot_path = cfg.run_dir / "config.json"
-    snapshot = json.loads(old_snapshot_path.read_text())
-    snapshot["implementation_sha256"] = "prior-code"
-    old_snapshot_path.write_text(json.dumps(snapshot))
-    first_run = False
-    seen.clear()
-    recovery = replace(cfg, run_id="rubric-retry", rubric_seed_run=cfg.run_dir)
-    summary = run_build(recovery, judge)
-    assert seen == ["Commercial"] * 4
-    assert summary["published"] and summary["counts"]["skipped"] == 1
-    assert source.read_bytes() == original
-    assert read_jsonl(recovery.run_dir / "rubric_records.jsonl")[0] == read_jsonl(source)[0]
-
-
-def test_invalid_row_after_limit_fails_read_only(config_factory):
-    sample, dec, plan = artifacts(raw_record())
-    row, _ = materialize(sample, dec, plan)
-    invalid = deepcopy(row)
-    invalid.update(doc_name="invalid", rubrics={"issues": []})
-    cfg = config_factory([row, invalid], evaluation_profile="rubric", mode="validate-only", limit=1)
-    before = cfg.input_jsonl.read_bytes()
-
-    def no_api(_request):
-        pytest.fail("Validation must finish before model requests")
-
-    with pytest.raises(DatasetError):
-        run_eval(cfg, no_api, no_api)
-    assert cfg.input_jsonl.read_bytes() == before
-    report = json.loads((cfg.run_dir / "summary.json").read_text())
-    assert report["invalid_by_category"] == {"Civil": 1}
-
-
-def test_decomposition_prompt_preserves_appeal_context():
-    messages = stage_messages("decompose", DECOMPOSITION_SCHEMA, {"instance_level": "Appellate"}, None)
-    assert "phúc thẩm, giám đốc thẩm hoặc tái thẩm" in messages[0]["content"]
-    assert json.loads(messages[1]["content"])["instance_level"] == "Appellate"
-
-
-def test_full_run_count_mismatch_stops_before_api_or_final_publication(config_factory, tmp_path):
-    cfg = config_factory([raw_record()], mode="build-rubrics", expected_count=600,
-                         final_application_jsonl=tmp_path / "application.jsonl",
-                         final_issue_spotting_jsonl=tmp_path / "spotting.jsonl")
-    with pytest.raises(ValueError, match="EXPECTED_COUNT=600"):
-        run_build(cfg, lambda _: pytest.fail("Wrong-sized input must fail before generation"))
-    summary = json.loads((cfg.run_dir / "rubric_generation_summary.json").read_text())
-    assert not cfg.final_application_jsonl.exists() and not summary["published"]
-    assert summary["counts"]["input"] == 1
-
-
-@pytest.mark.parametrize("retry_into", [False, True])
-def test_rubric_resume_helper_restores_raw_input_and_settings(config_factory, monkeypatch, tmp_path, retry_into):
-    cfg = config_factory([raw_record()], mode="build-rubrics", expected_count=1, rubric_concurrency=11,
-                         final_application_jsonl=tmp_path / "application.jsonl",
-                         final_issue_spotting_jsonl=tmp_path / "spotting.jsonl")
-    run_build(cfg, lambda _: httpx.Response(503))
-    scripts = Path(__file__).resolve().parents[1] / "scripts"
-    monkeypatch.syspath_prepend(str(scripts))
-    import resume_rubric_run
-
-    monkeypatch.setenv("PROJECT_ROOT", str(cfg.project_root))
-    monkeypatch.setenv("OUTPUT_DIR", str(cfg.output_dir))
-    monkeypatch.setenv("RAW_INPUT_JSONL", "wrong.jsonl")
-    monkeypatch.setenv("RUBRIC_CONCURRENCY", "99")
-    args = ["--retry-into", "new-run"] if retry_into else []
-    monkeypatch.setattr(sys, "argv", [str(scripts / "resume_rubric_run.py"), cfg.run_id, *args])
-    monkeypatch.setattr(resume_rubric_run.os, "chdir", lambda _: None)
-    captured = {}
-    monkeypatch.setattr(resume_rubric_run.os, "execvpe", lambda _, argv, env: captured.update(env))
-    assert resume_rubric_run.main() == 0
-    for key, value in captured.items():
-        monkeypatch.setenv(key, value)
-    restored = Config.from_env()
-    assert restored.resume == (not retry_into) and restored.mode == "build-rubrics"
-    assert restored.rubric_seed_run == (cfg.run_dir if retry_into else None)
-    assert restored.run_id == ("new-run" if retry_into else cfg.run_id)
-    assert restored.input_jsonl == cfg.input_jsonl
-    assert restored.rubric_concurrency == 11 and restored.expected_count == 1
-
-
-def test_atomic_grounding_and_group_adjustments_are_validated():
-    sample, dec, plan = artifacts(raw_record())
-    original = sample.raw["input"]["facts_clean"]
-    broken = deepcopy(plan)
-    broken["assignments"][0]["rule_indices"] = []
-    with pytest.raises(ValueError, match="Fact-to-Rule needs input facts and rules"):
-        materialize(sample, dec, broken, version=2)
-    broken["assignments"][0].update(missing_information=["Thiếu quy định quyết định nghĩa vụ"], decisive=True,
-                                    review_reason="Input không chứa quy định được viện dẫn")
-    record, _ = materialize(sample, dec, broken, version=2)
-    issue = record["rubrics"]["issues"][0]
-    criterion = issue["groups"][0]["criteria"][0]
-    assert criterion["needs_review"] and not criterion["scorable"]
-    assert evaluation_plan(replace(sample, raw=record))["issues"][0]["application_scorable"] is False
-    assert record["input"]["facts_clean"] == original
-
-    wrong_group = deepcopy(plan)
-    wrong_group["assignments"][0]["group_id"] = "obligations"
-    with pytest.raises(ValueError, match="group_adjustment_reason"):
-        materialize(sample, dec, wrong_group, version=2)
-    wrong_group["assignments"][0]["group_adjustment_reason"] = "Bước này xác lập nghĩa vụ thanh toán."
-    moved, _ = materialize(sample, dec, wrong_group, version=2)
-    assert moved["rubrics"]["issues"][0]["groups"][0]["group_id"] == "obligations"
-    wrong_source = deepcopy(dec)
-    wrong_source["units"][0]["evidence"][0]["quote"] = "B ký nhận hai tỷ đồng."
-    with pytest.raises(ValueError, match="verbatim"):
-        materialize(sample, wrong_source, plan, version=2)
-
-
-@pytest.mark.parametrize("bad_link", ["duplicate", "disjoint", "missing"])
-def test_independent_coverage_blocks_reuse_or_wrong_evidence_within_one_segment(bad_link):
-    from legal_application.rubric_quality import audit_coverage
-
-    sample, dec, plan = artifacts(raw_record())
-    sources = source_segments(sample.raw["expected_answer"], "S")
-    dec["units"][0]["evidence"][0]["quote"] = "B ký nhận nợ"
-    dec["units"][1]["evidence"][0]["quote"] = "B phải trả 100 đồng"
-    _, audit = materialize(sample, dec, plan, version=2)
-    audit_inventory = fixture_inventory(dec)
-    decision = fixture_audit(dec, plan)
-    first, second = decision["coverage"]
-    if bad_link == "duplicate":
-        second.update(unit_id="U1", status="mapped")
-        message = "one unit cannot cover multiple atomic propositions"
-    elif bad_link == "disjoint":
-        first.update(unit_id="U2", status="excluded")
-        second.update(unit_id="U1", status="mapped")
-        message = "overlap verbatim evidence"
-    else:
-        first.update(unit_id=None, status="missing")
-        message = "cannot approve with missing"
-    with pytest.raises(ValueError, match=message):
-        audit_coverage(audit_inventory, decision, dec, audit, sources, TAXONOMY["Civil"])
-
-
-@pytest.mark.parametrize("inventoried", [True, False])
-def test_same_segment_missing_reasoning_is_counted_and_requests_decomposition_repair(config_factory, tmp_path, inventoried):
-    raw = raw_record()
-    sample, dec, plan = artifacts(raw)
-    dec["units"][0]["evidence"][0]["quote"] = "B ký nhận nợ"
-    extra = {**dec["units"][0], "unit_id": "P3", "reasoning": "Tòa xác định phải trả 100 đồng",
-             "reasoning_type": "legal_consequence",
-             "evidence": [{"source_id": "S1", "quote": "B phải trả 100 đồng"}]}
-    inventory = fixture_inventory(dec)
-    if inventoried:
-        inventory["propositions"].append(extra)
-    bad = fixture_audit(dec, plan, stage="decompose", problems=["S1 còn thiếu nhận định phải trả 100 đồng"])
-    if not inventoried:
-        bad["additional_propositions"] = [extra]
-    bad["coverage"].append({"proposition_id": "P3", "status": "missing", "unit_id": None,
-                            "reason": "Unit hiện tại chỉ xác định giấy ký nhận, chưa có hệ quả."})
-    cfg = config_factory([raw], mode="build-rubrics", expected_count=1, rubric_json_retries=0,
-                         final_application_jsonl=tmp_path / "application.jsonl",
-                         final_issue_spotting_jsonl=tmp_path / "spotting.jsonl")
-
-    def reply(request):
-        body = json.loads(request.content)
-        fields = body["response_format"]["json_schema"]["schema"]["properties"]
-        stage = request_stage(fields)
-        if stage == "inventory":
-            assert "decomposition" not in json.loads(body["messages"][1]["content"])
-        return httpx.Response(200, json=envelope(json.dumps({"decompose": dec, "map": plan,
-                                                             "inventory": inventory, "audit": bad}[stage])))
-
-    summary = run_build(cfg, reply)
-    assert set(sources_id for unit in dec["units"] for sources_id in unit["source_ids"]) == {"S1"}
-    assert summary["counts"]["missing_propositions"] == 1
-    assert summary["counts"]["rubric_coverage"] is None and not summary["published"]
-    error = read_jsonl(cfg.run_dir / "errors.jsonl")[0]
-    assert error["metadata"]["proposition_audit"]["dispositions"][-1]["status"] == "missing"
-    assert not cfg.final_application_jsonl.exists() and not cfg.final_issue_spotting_jsonl.exists()
-
-
-def test_unnecessary_added_issue_is_remapped_and_reaudited(config_factory, tmp_path):
-    raw = raw_record()
-    _, dec, draft = artifacts(raw, add=True)
-    draft["added_issues"][0]["issue_text"] = "B có phải hoàn trả nghĩa vụ tiền đã cam kết?"
-    repaired = deepcopy(draft)
-    repaired["added_issues"] = []
-    repaired["issues"].pop()
-    repaired["assignments"][-1]["issue_index"] = 1
-    cfg = config_factory([raw], mode="build-rubrics", expected_count=1, rubric_json_retries=1,
-                         final_application_jsonl=tmp_path / "application.jsonl",
-                         final_issue_spotting_jsonl=tmp_path / "spotting.jsonl")
+def test_resume_replays_torn_pair_and_only_calls_failed_sample(config_factory):
+    config = settings(config_factory, [raw_record("ok"), raw_record("error", "Criminal", n=2)],
+                      batch_size=1, expected_count=2, rubric_json_retries=0)
     calls = []
 
-    def reply(request):
-        body = json.loads(request.content)
-        fields = body["response_format"]["json_schema"]["schema"]["properties"]
-        payload = json.loads(body["messages"][1]["content"])
-        stage = request_stage(fields)
-        calls.append(stage)
-        if stage == "decompose":
-            value = dec
-        elif stage == "inventory":
-            value = fixture_inventory(dec)
-        elif stage == "map":
-            value = repaired if "previous_attempt" in payload else draft
-        else:
-            if payload["plan"]["added_issues"]:
-                value = fixture_audit(dec, draft, stage="map", problems=["Issue gốc Q1 đã bao phủ đề xuất Q2."])
-            else:
-                value = fixture_audit(dec, repaired)
-        return httpx.Response(200, json=envelope(json.dumps(value, ensure_ascii=False)))
+    def first(request):
+        _, payload = request_payload(request)
+        calls.append(payload["category"])
+        return response(model_output(payload) if payload["category"] == "Civil" else {"issues": []})
 
-    complete = run_build(cfg, reply)
-    assert complete["published"] and complete["counts"]["added_issues"] == 0
-    assert calls == ["decompose", "map", "inventory", "audit", "map", "audit"]
-    assert read_jsonl(cfg.final_issue_spotting_jsonl)[0]["expected_answer"] == raw["issues"]
+    initial = build(config, first)
+    assert initial["status"] == "completed_with_errors"
+    assert initial["counts"]["completed"] == initial["counts"]["failed"] == 1
+    assert initial["missing_doc_names"] == ["error"]
+    verify_pair(config, 1)
+    data = config.final_issue_spotting_jsonl.read_bytes()
+    config.final_issue_spotting_jsonl.write_bytes(data[:10])
+    config.final_application_jsonl.unlink()
+
+    def second(request):
+        assert config.final_issue_spotting_jsonl.read_bytes() == data
+        verify_pair(config, 1)
+        _, payload = request_payload(request)
+        calls.append(payload["category"])
+        return response(model_output(payload))
+
+    resume = replace(config, resume=True)
+    result = build(resume, second)
+    assert result["status"] == "completed"
+    assert result["counts"]["completed"] == 2 and result["counts"]["skipped"] == 1
+    assert result["counts"]["failed"] == 0
+    assert calls == ["Civil", "Criminal", "Criminal"]
+    verify_pair(config, 2)
+
+    def no_call(_):
+        pytest.fail("Already completed")
+
+    assert build(resume, no_call)["counts"]["skipped"] == 2
+
+
+def test_output_conflict_does_not_overwrite_or_call_model(config_factory):
+    config = settings(config_factory)
+    app = config.final_application_jsonl
+    app.write_text("existing data", encoding="utf-8")
+    with pytest.raises(ValueError, match="Final dataset already exists"):
+        build(config, lambda _: pytest.fail("Unexpected call"))
+    assert app.read_text(encoding="utf-8") == "existing data"
+
+
+def test_retry_into_new_pair_imports_successes(config_factory):
+    source = settings(config_factory, [raw_record("ok"), raw_record("error", "Labor")],
+                      rubric_json_retries=0)
+
+    def first(request):
+        _, payload = request_payload(request)
+        return response(model_output(payload) if payload["category"] == "Civil" else {"issues": []})
+
+    assert build(source, first)["counts"]["completed"] == 1
+    retry = replace(source, run_id="retry", rubric_seed_run=source.run_dir,
+                    final_application_jsonl=source.project_root / "retry-app.jsonl",
+                    final_issue_spotting_jsonl=source.project_root / "retry-spot.jsonl")
+
+    def second(request):
+        _, payload = request_payload(request)
+        assert payload["category"] == "Labor"
+        assert verify_pair(retry, 1) == verify_pair(source, 1)
+        return response(model_output(payload))
+
+    result = build(retry, second)
+    assert result["counts"]["skipped"] == 1 and result["counts"]["completed"] == 2
+    verify_pair(retry, 2)
+    verify_pair(source, 1)
+
+
+def test_raw_preflight_count_validation(config_factory):
+    config = settings(config_factory, expected_count=2)
+    with pytest.raises(ValueError, match="found 1"):
+        build(config, lambda _: pytest.fail("Unexpected call"))
+    assert not config.final_application_jsonl.exists()
+
+
+def test_unknown_raw_category_retains_line_report(config_factory):
+    config = settings(config_factory, [raw_record(category="Unknown")])
+    with pytest.raises(DatasetError, match="Input validation failed"):
+        build(config, lambda _: pytest.fail("Unexpected call"))
+    errors = json.loads((config.run_dir / "rubric_generation_summary.json").read_text())["input_validation_errors"]
+    assert errors[0]["input_line"] == 1
+    assert errors[0]["category"] == "Unknown"
+
+
+def test_new_schema_eval_no_leak_and_issue_macro_average(config_factory):
+    config = settings(config_factory, [raw_record(n=2)])
+
+    def generate_rubric(request):
+        _, payload = request_payload(request)
+        result = model_output(payload)
+        result["issues"][0]["groups"][0]["criteria"].append(
+            {"description": "Phân tích hậu quả pháp lý", "reference_reasoning": "Buộc hoàn trả khoản nợ."})
+        del result["issues"][1]["reference_verdict"]
+        return response(result)
+
+    build(config, generate_rubric)
+    app, = verify_pair(config, 1)
+    candidate = "Vì B đã thừa nhận nợ nên phải thanh toán."
+    labels_sent = []
+
+    def gen(request):
+        prompt = json.loads(request.content)["messages"][1]["content"]
+        for private in (ANSWER, REASONING, "Civil", "reference_reasoning", "DS-ST"):
+            assert private not in prompt
+        assert all(issue in prompt for issue in app["input"]["issues"])
+        return response(candidate)
+
+    def judge(request):
+        _, payload = request_payload(request)
+        assert payload["rubrics"] == app["rubrics"]
+        assert payload["evaluated_model_response"] == candidate
+        plan = payload["evaluation_plan"]
+        assert not plan["needs_review"]
+        assert "reference_reasoning" in payload["rubrics"]["issues"][0]["groups"][0]["criteria"][0]
+        results = [
+            {"issue_index": i, "evaluation_status": "scored",
+             "criterion_scores": [{"criterion_id": criterion_id, "score": score,
+                                   "evidence_from_model_answer": [], "explanation": "Đối chiếu nội dung."}
+                                  for criterion_id, score in zip(issue["criterion_ids"], scores)],
+             "outcome_correct": True if issue["outcome_scorable"] else None, "outcome_explanation": "Đánh giá riêng."}
+            for i, (issue, scores) in enumerate(zip(plan["issues"], [[2, 1], [0]]), 1)]
+        labels = {"doc_name": app["doc_name"], "category": app["category"], "issues_evaluation": results,
+                  "needs_review": False, "evaluation_status": "completed"}
+        labels_sent.append(labels)
+        return response(labels)
+
+    eval_config = replace(config, input_jsonl=config.final_application_jsonl, mode="full", run_id="eval")
+    result = asyncio.run(Pipeline(eval_config, generator_transport=httpx.MockTransport(gen),
+                                  judge_transport=httpx.MockTransport(judge)).run())
+    assert result["application_score"] == 0.375
+    assert result["outcome_accuracy"] == 1
+    labels_sent[0]["issues_evaluation"][1]["criterion_scores"][0]["criterion_id"] = "invented"
+    with pytest.raises(LabelError, match="eligible criterion"):
+        score_rubric_labels(labels_sent[0], rubric_sample(app, 0), candidate)
+
+
+def test_real_input_ten_rows_with_mock_endpoint(config_factory):
+    sample_path = Path(__file__).resolve().parents[1] / "input" / "sample_v2.jsonl"
+    if not sample_path.is_file():
+        pytest.skip("The local sample_v2 dataset is unavailable")
+    config = replace(settings(config_factory, expected_count=10), input_jsonl=sample_path)
+    calls = []
+
+    def handler(request):
+        _, payload = request_payload(request)
+        calls.append(payload["category"])
+        return response(model_output(payload))
+
+    result = build(config, handler)
+    assert result["status"] == "completed"
+    assert result["counts"]["completed"] == 10 and len(calls) == 10
+    assert result["counts"]["failed"] == 0
+    assert all(evaluation_plan(rubric_sample(row, i))["issues"] for i, row in enumerate(verify_pair(config, 10)))
+
+
+def test_existing_v2_dataset_still_validates_with_manifest(config_factory):
+    config = settings(config_factory)
+    build(config, lambda request: response(model_output(request_payload(request)[1])))
+    app, = verify_pair(config, 1)
+    rubric = app["rubrics"]
+    rubric.update(version=2, status="verified")
+    issue, = rubric["issues"]
+    issue.update(verdict_evidence=[ANSWER], outcome_review_reason=None, issue_review_reason=None)
+    group, = issue["groups"]
+    assert group["group_name"] == TAXONOMY["Civil"][group["group_id"]]
+    criterion, = group["criteria"]
+    criterion["criterion"] = criterion.pop("description")
+    criterion.update(unit_id="U1", source_evidence=[ANSWER], relevant_facts=[], rule_refs=[],
+                     needs_review=False, scorable=True, decisive=False, review_reason=None, missing_information=[],
+                     reasoning_type="legal_consequence", legal_condition=None, application_link=None)
+    atomic_jsonl(config.final_application_jsonl, [app])
+    check = replace(config, mode="validate-only", input_jsonl=config.final_application_jsonl, run_id="missing-manifest")
+    with pytest.raises(DatasetError, match="Input validation failed"):
+        asyncio.run(Pipeline(check).run())
+    path = config.final_application_jsonl.with_suffix(".jsonl.manifest.json")
+    atomic_json(path, {"kind": "rule_application_rubrics", "complete": True, "sample_count": 1, "rubric_protocol": 2,
+                       "application": {"sha256": file_hash(config.final_application_jsonl)}})
+    assert asyncio.run(Pipeline(replace(check, run_id="with-manifest")).run())["status"] == "validated"

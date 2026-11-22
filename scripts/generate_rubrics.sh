@@ -3,6 +3,7 @@ set -euo pipefail
 
 export PROJECT_ROOT="${PROJECT_ROOT:-/workspace/storage-shared/nlp/users/minhpn19/LegalApplication}"
 export RAW_INPUT_JSONL="${RAW_INPUT_JSONL:-${PROJECT_ROOT}/input/final_raw_600_input_application.jsonl}"
+# Each successful sample is written to both final files. Use separate paths for test runs.
 export FINAL_APPLICATION_JSONL="${FINAL_APPLICATION_JSONL:-${PROJECT_ROOT}/input/final/final_600_rule_application.jsonl}"
 export FINAL_ISSUE_SPOTTING_JSONL="${FINAL_ISSUE_SPOTTING_JSONL:-${PROJECT_ROOT}/input/final/final_600_issue_spotting.jsonl}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs}"

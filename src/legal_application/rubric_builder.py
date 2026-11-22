@@ -1,166 +1,154 @@
-"""Build a paired Application and Issue Spotting dataset using the shared run machinery."""
+"""Generate issue rubrics and checkpoint the paired final datasets."""
 from __future__ import annotations
 
 import asyncio
 import fcntl
 import json
 import logging
+import os
+import re
 from collections import Counter
 from contextlib import ExitStack
-from copy import deepcopy
 from pathlib import Path
 
 from tqdm import tqdm
 
 from .api import APIClient, APIError, IncompleteResponse
-from .data import DatasetError, canonical_hash, read_dataset, strict_json, text_field
+from .data import DatasetError, canonical_hash, read_dataset, strict_json
 from .pipeline import Pipeline, bounded_map, index_records
 from .prompts import prompt_text
-from .rubric_quality import AUDIT_V2, INVENTORY_SCHEMA, audit_coverage, extend_inventory, validate_inventory, verified_rows
-from .rubric_taxonomy import CIVIL_ANCHOR, PROCEDURAL_ANCHORS, TAXONOMY, canonical_category
-from .rubrics import (AUDIT_SCHEMA, DECOMPOSITION_V2, PLAN_V2, RUBRIC_PROTOCOL, criteria_for, issue_blocked, materialize,
-                      raw_rubric_sample, require_schema, resolve_verdict_ids, source_segments, validate_decomposition)
-from .storage import atomic_json, atomic_jsonl, file_hash, implementation_hash, now, read_jsonl
+from .rubric_taxonomy import TAXONOMY, canonical_category
+from .rubrics import (RUBRIC_PROTOCOL, criteria_for, load_schema, normalized, raw_rubric_sample, require_schema,
+                      validate_rubric_record)
+from .storage import append_jsonl, atomic_json, file_hash, implementation_hash, now, read_jsonl
 from .thinking import resolve_thinking
 
 log = logging.getLogger(__name__)
+GENERATION_SCHEMA = load_schema("rubric_generation")
 
 
-def stage_messages(stage, schema, payload, repair):
-    system = prompt_text(f"rubric_{stage}")
-    if stage in {"map", "audit"}:
-        system += "\n" + prompt_text("rubric_scope")
+def generation_messages(sample, taxonomy, repair):
+    payload = {"expected_answer": sample.raw["expected_answer"], "category": canonical_category(sample.raw["category"]),
+               "facts_clean": sample.raw["input"]["facts_clean"], "rules": sample.raw["input"]["rules"],
+               "gold_issues": [{"issue_index": i, "issue_text": text} for i, text in enumerate(sample.issues, 1)],
+               "taxonomy": taxonomy}
+    system = prompt_text("rubric_generate") + "\nJSON SCHEMA:\n" + json.dumps(GENERATION_SCHEMA, ensure_ascii=False)
     if repair:
-        system += "\nKết quả trước bị từ chối. Đọc lại nguồn và sửa phát hiện sau: " + repair
-    system += "\nJSON SCHEMA:\n" + json.dumps(schema, ensure_ascii=False)
+        system += "\nKết quả trước chưa đúng cấu trúc: " + repair + ". Trả lại đầy đủ JSON và mọi gold issue."
     return [{"role": "system", "content": system},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, allow_nan=False)}]
 
 
-class AuditRejected(ValueError):
-    def __init__(self, decision):
-        super().__init__("Semantic audit rejected: " + " | ".join(decision["problems"]))
-        self.repair_stage = decision["repair_stage"]
+def parse_generation(content):
+    content = content.strip().removeprefix("\ufeff").strip()
+    fenced = re.fullmatch(r"```(?:json)?[ \t]*\r?\n(.*?)\r?\n```", content, flags=re.IGNORECASE | re.DOTALL)
+    result = strict_json(fenced[1] if fenced else content)
+    require_schema(GENERATION_SCHEMA, result, "Rubric response")
+    return result
 
 
-async def build_sample(config, sample, client) -> dict:
-    raw = sample.raw
-    category = canonical_category(raw["category"])
-    taxonomy = TAXONOMY[category]
-    source = source_segments(raw["expected_answer"], "S")
-    common = {"category": category, "expected_answer_segments": source, "taxonomy": taxonomy,
-              "analysis_reference": PROCEDURAL_ANCHORS.get(category, CIVIL_ANCHOR),
-              "instance_level": raw.get("instance_level"), "code": raw.get("code")}
-    context = {**common, **raw["input"], "facts_clean_segments": source_segments(raw["input"]["facts_clean"], "F")}
+def build_issue(source, index, text, taxonomy):
+    groups, other_ids, seen, notes = {}, {}, set(), list(source.get("warnings", []))
+    for raw_group in source["groups"]:
+        model_id = raw_group["group_id"].strip()
+        group_id = model_id
+        if model_id not in taxonomy:
+            if model_id not in other_ids:
+                other_ids[model_id] = f"other_{len(other_ids) + 1}"
+                notes.append(f"Nhóm ngoài taxonomy: {model_id}")
+            group_id = other_ids[model_id]
+        for raw_criterion in raw_group["criteria"]:
+            description = raw_criterion["description"].strip()
+            reasoning = raw_criterion["reference_reasoning"].strip()
+            if not description or not reasoning:
+                notes.append("Tiêu chí có nội dung trống.")
+                continue
+            key = normalized(description), normalized(reasoning)
+            if key in seen:
+                notes.append("Tiêu chí trùng lặp.")
+                continue
+            seen.add(key)
+            groups.setdefault(group_id, []).append({"description": description, "reference_reasoning": reasoning})
+    if not groups:
+        raise ValueError(f"Issue {index} requires at least one nonempty criterion")
+    issue = {"issue_index": index, "issue_text": text, "groups": []}
+    number = 0
+    for group_id, criteria in groups.items():
+        for criterion in criteria:
+            number += 1
+            criterion["criterion_id"] = f"I{index}_C{number}"
+        issue["groups"].append({"group_id": group_id, "group_name": taxonomy.get(group_id, "Nội dung khác"),
+                                "criteria": criteria})
+    if verdict := (source.get("reference_verdict") or "").strip():
+        issue["reference_verdict"] = verdict
+    return issue, notes
 
-    # Constrain verdict IDs at generation time. The materializer can still resolve a
-    # known U ID safely when an endpoint returns a JSON object without enforcing this enum.
-    map_schema = deepcopy(PLAN_V2)
-    verdict_ids = map_schema["properties"]["issues"]["items"]["properties"]["verdict_source_ids"]
-    verdict_ids["items"]["enum"] = list(source)
-    calls, errors, retries, drafts, proposal_attempts = [], [], [], {}, []
-    stage, repair = "decompose", None
-    mapping_feedback = None
-    inventory, coverage, coverage_details = None, None, None
-    attempt = 0
 
-    async def request(schema, payload, *, validator_schema=None):
-        if repair and stage in drafts and stage != "audit":
-            payload = {**payload, "previous_attempt": drafts[stage]}
+def materialize(sample, value, taxonomy):
+    indexed = {row["issue_index"]: row for row in value["issues"]}
+    if len(indexed) != len(value["issues"]) or indexed.keys() != set(range(1, len(sample.issues) + 1)):
+        raise ValueError("Rubric response must contain each gold issue_index exactly once")
+    issues, added = [], []
+    warnings = [{"reason": note} for note in value.get("warnings", []) if note.strip()]
+    texts = list(sample.issues)
+    known = {normalized(text) for text in texts}
+    for index, text in enumerate(texts, 1):
+        issue, notes = build_issue(indexed[index], index, text, taxonomy)
+        issues.append(issue)
+        warnings.extend({"issue_index": index, "reason": note} for note in notes if note.strip())
+    for extra in value.get("added_issues", []):
+        text, reason = extra["issue_text"].strip(), extra["reason"].strip()
+        if not text or not reason or normalized(text) in known:
+            warnings.append({"issue_text": text, "reason": "Bỏ issue bổ sung trùng hoặc thiếu nội dung."})
+            continue
+        index = len(issues) + 1
         try:
-            response = await client.complete(stage_messages(stage, schema, payload, repair), doc_name=sample.doc_name, schema=schema)
-        except APIError as exc:
-            calls.append({"stage": stage, **exc.metadata})
-            raise
-        calls.append({"stage": stage, **response.metadata})
-        value = strict_json(response.content)
-        drafts[stage] = value
-        require_schema(validator_schema or schema, value, stage)
-        return value
+            issue, notes = build_issue(extra, index, text, taxonomy)
+        except ValueError as exc:
+            warnings.append({"issue_text": text, "reason": str(exc)})
+            continue
+        known.add(normalized(text))
+        texts.append(text)
+        issues.append(issue)
+        added.append({"issue_index": index, "issue_text": text, "reason": reason,
+                      "reference_reasoning": [c["reference_reasoning"] for c in criteria_for(issue)]})
+        warnings.extend({"issue_index": index, "reason": note} for note in notes if note.strip())
+    record = {key: value for key, value in sample.raw.items() if key != "issues"}
+    record["input"] = {**record["input"], "issues": texts}
+    record["rubrics"] = {"version": RUBRIC_PROTOCOL, "issues": issues}
+    validate_rubric_record(record)
+    return record, added, warnings
 
-    while True:
+
+async def build_sample(config, sample, client):
+    taxonomy = TAXONOMY[canonical_category(sample.raw["category"])]
+    calls, errors, repair = [], [], None
+    for attempt in range(config.rubric_json_retries + 1):
         try:
-            if stage == "decompose":
-                decomposition = await request(DECOMPOSITION_V2, common)
-                units = validate_decomposition(decomposition, source, taxonomy=taxonomy)
-                stage, repair = "map", mapping_feedback
-                mapping_feedback = None
-                # Old mapping IDs may have changed after re-decomposition.
-                drafts.pop("map", None)
-            if stage == "map":
-                map_input = {**context, "decomposition": decomposition}
-                plan = await request(map_schema, map_input, validator_schema=PLAN_V2)
-                record, audit = materialize(sample, decomposition, plan, version=RUBRIC_PROTOCOL)
-                pending_proposals = None
-                if audit["added_issues"]:
-                    pending_proposals = {"attempt": attempt + 1, "proposals": audit["added_issues"],
-                                         "audit_status": "unverified"}
-                    proposal_attempts.append(pending_proposals)
-                stage, repair = ("inventory" if inventory is None else "audit"), None
-            if stage == "inventory":
-                inventory = await request(INVENTORY_SCHEMA, common)
-                validate_inventory(inventory, source, taxonomy)
-                stage, repair = "audit", None
-            # Audit the source IDs and issue review reasons actually used in the public rubric.
-            audit_plan = {**plan, "issues": [
-                {**outcome, "verdict_source_ids": resolve_verdict_ids(outcome["verdict_source_ids"], units, source),
-                 "issue_review_reason": issue["issue_review_reason"]}
-                for outcome, issue in zip(plan["issues"], record["rubrics"]["issues"])
-            ]}
-            decision = await request(AUDIT_V2, {**context, "decomposition": decomposition, "plan": audit_plan,
-                                               "independent_inventory": inventory})
-            coverage = audit_coverage(inventory, decision, decomposition, audit, source, taxonomy)
-            coverage_details = {"propositions": inventory["propositions"] + decision["additional_propositions"],
-                                "dispositions": decision["coverage"]}
-            if not decision["approved"]:
-                inventory = extend_inventory(inventory, decision["additional_propositions"])
-                if pending_proposals is not None:
-                    pending_proposals.update(audit_status="requires_repair", audit_problems=decision["problems"])
-            validate_audit(decision)
-            if pending_proposals is not None:
-                pending_proposals["audit_status"] = "audit_accepted"
-            return {**sample.identity(), "category": raw["category"], "dataset": record, "audit": audit,
-                    "decomposition": decomposition, "plan": plan, "semantic_audit": decision, "inventory": inventory,
-                    "proposition_counts": coverage,
-                    "model": config.rubric_model, "dataset_sha256": canonical_hash(record),
-                    "metadata": {"completed_at": now(), "calls": calls, "validation_errors": errors,
-                                 "retry_stages": retries, "attempts": attempt + 1, "proposal_attempts": proposal_attempts}}
-        except (ValueError, IncompleteResponse) as exc:
-            target = exc.repair_stage if isinstance(exc, AuditRejected) else stage
+            response = await client.complete(generation_messages(sample, taxonomy, repair),
+                                             doc_name=sample.doc_name, schema=GENERATION_SCHEMA)
+        except IncompleteResponse as exc:
+            calls.append(exc.metadata)
             repair = str(exc)
-            errors.append(repair)
-            log.warning("Rubric validation failed doc_name=%s stage=%s retry_stage=%s attempt=%d error=%s",
-                        sample.doc_name, stage, target, attempt + 1, repair)
-            if attempt == config.rubric_json_retries:
-                raise APIError("Rubric validation exhausted: " + repair,
-                               {"calls": calls, "validation_errors": errors, "retry_stages": retries,
-                                "failed_stage": stage, "attempts": attempt + 1, "proposition_counts": coverage,
-                                "proposition_audit": coverage_details, "proposal_attempts": proposal_attempts}) from None
-            retries.append({"failed_stage": stage, "retry_stage": target})
-            if isinstance(exc, AuditRejected) and target == "decompose":
-                mapping_feedback = repair
-            stage = target
-            if config.retry_backoff:
-                await asyncio.sleep(min(60, config.retry_backoff * 2 ** attempt))
-            attempt += 1
         except APIError as exc:
-            raise APIError(str(exc), {"calls": calls, "validation_errors": errors, "retry_stages": retries,
-                                      "failed_stage": stage, "attempts": attempt + 1, "proposition_counts": coverage,
-                                      "proposition_audit": coverage_details, "proposal_attempts": proposal_attempts}) from None
-
-
-def validate_audit(decision):
-    require_schema(AUDIT_SCHEMA, decision, "semantic audit")
-    for problem in decision["problems"]:
-        text_field(problem, "audit problem")
-    if decision["approved"] != (not decision["problems"]):
-        raise ValueError("Semantic audit approval and problems are inconsistent")
-    if decision["approved"] and decision.get("repair_stage") is not None:
-        raise ValueError("Approved semantic audit must have repair_stage=null")
-    if not decision["approved"]:
-        if decision.get("repair_stage") is None:
-            raise ValueError("Rejected semantic audit must specify repair_stage")
-        raise AuditRejected(decision)
+            calls.append(exc.metadata)
+            raise APIError(str(exc), {"calls": calls, "validation_errors": errors}) from None
+        else:
+            calls.append(response.metadata)
+            try:
+                record, added, warnings = materialize(sample, parse_generation(response.content), taxonomy)
+            except ValueError as exc:
+                repair = str(exc)
+            else:
+                return {**sample.identity(), "category": sample.raw["category"], "dataset": record,
+                        "dataset_sha256": canonical_hash(record), "added_issues": added, "warnings": warnings,
+                        "model": config.rubric_model,
+                        "metadata": {"completed_at": now(), "calls": calls, "validation_errors": errors}}
+        errors.append(repair)
+        log.warning("Rubric output invalid doc_name=%s attempt=%d error=%s", sample.doc_name, attempt + 1, repair)
+        if attempt < config.rubric_json_retries and config.retry_backoff:
+            await asyncio.sleep(min(60.0, config.retry_backoff * 2 ** attempt))
+    raise APIError(f"Rubric output exhausted retries: {repair}", {"calls": calls, "validation_errors": errors})
 
 
 def read_seed_run(config, snapshot):
@@ -170,48 +158,68 @@ def read_seed_run(config, snapshot):
     with (seed / ".run.lock").open("rb") as lock:
         fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
         previous = strict_json((seed / "config.json").read_text(encoding="utf-8"))
-        if isinstance(previous, dict) and previous.get("rubric_protocol") != RUBRIC_PROTOCOL:
-            raise ValueError("Seed run predates independent proposition auditing. Start a fresh generation with RESUME=0.")
+        if not isinstance(previous, dict) or previous.get("rubric_protocol") != RUBRIC_PROTOCOL:
+            raise ValueError("The seed run uses an older rubric format. Start a fresh run with RESUME=0.")
         keys = ("pipeline_kind", "artifact_version", "input_sha256", "limit", "rubric_model",
                 "rubric_base_url", "rubric_thinking", "rubric_response_format")
-        if not isinstance(previous, dict) or any(previous.get(key) != snapshot[key] for key in keys):
+        if any(previous.get(key) != snapshot[key] for key in keys):
             raise ValueError("Seed run must match the raw input checksum, selection and rubric model settings")
         path = seed / "rubric_records.jsonl"
         return read_jsonl(path), file_hash(path)
 
 
+def spotting_row(record):
+    payload = record["input"]
+    return {"input": payload["facts_clean"], "expected_answer": payload["issues"]}
+
+
+def output_rows(row):
+    return [[row["dataset"]], [spotting_row(row["dataset"])],
+            *([{"doc_name": row["doc_name"], "category": row["category"], **item} for item in row[key]]
+              for key in ("added_issues", "warnings"))]
+
+
+def reconcile_jsonl(path, records):
+    """Restore a missing suffix from the journal and discard only a torn append."""
+    path.touch(exist_ok=True)
+    with path.open("r+b") as handle:
+        restored = False
+        for record in records:
+            offset = handle.tell()
+            line = handle.readline()
+            expected = (json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n").encode()
+            if line == expected:
+                continue
+            if line and not expected.startswith(line):
+                raise ValueError(f"Output differs from saved rubric journal: {path}")
+            handle.seek(offset)
+            handle.truncate()
+            handle.write(expected)
+            restored = True
+        if handle.read(1):
+            raise ValueError(f"Output has extra rows outside the saved rubric journal: {path}")
+        if restored:
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def reconcile_outputs(paths, rows):
+    for index, path in enumerate(paths):
+        reconcile_jsonl(path, (item for row in rows for item in output_rows(row)[index]))
+
+
 def rubric_counts(samples, rows, errors):
-    names = {s.doc_name for s in samples}
-    selected_rows = [row for row in rows if row["doc_name"] in names]
-    selected_errors = [row for row in errors if row["doc_name"] in names]
-    issues = [issue for row in selected_rows for issue in row["dataset"]["rubrics"]["issues"]]
-    criteria = [c for issue in issues for c in criteria_for(issue)]
-    additions = sum(len(row["audit"]["added_issues"]) for row in selected_rows)
-    propositions = {row["doc_name"]: row["metadata"].get("proposition_counts") for row in selected_errors}
-    propositions.update({row["doc_name"]: row["proposition_counts"] for row in selected_rows})
-    known = [counts for counts in propositions.values() if counts is not None]
-    totals = {status: sum(counts[status] for counts in known) for status in ("mapped", "excluded", "missing", "unverified")}
-    denominator = totals["mapped"] + totals["missing"] + totals["unverified"]
-    unassessed = len(samples) - len(known)
-    failed = {row["doc_name"] for row in selected_errors} - {row["doc_name"] for row in selected_rows}
-    return {"selected": len(samples), "completed": len(selected_rows), "failed": len(failed),
-            "pending": len(samples) - len(selected_rows) - len(failed),
-            "original_issues": sum(len(sample.issues) for sample in samples), "added_issues": additions,
-            "samples_with_added_issues": sum(bool(row["audit"]["added_issues"]) for row in selected_rows),
-            "atomic_units": sum(len(row["audit"]["source_units"]) for row in selected_rows),
-            "atomic_propositions": sum(totals.values()), **{f"{status}_propositions": value for status, value in totals.items()},
-            "unassessed_samples": unassessed, "unaudited_or_rejected_samples": len(samples) - len(selected_rows),
-            "rubric_coverage": (totals["mapped"] / denominator if denominator and len(selected_rows) == len(samples)
-                                and not unassessed and not totals["unverified"] else None),
-            "criteria": len(criteria), "criteria_needing_review": sum(c["needs_review"] for c in criteria),
-            "issues_needing_review": sum(i["issue_review_reason"] is not None or i["outcome_review_reason"] is not None or
-                                        any(c["needs_review"] for c in criteria_for(i)) for i in issues),
-            "issues_excluded_from_application_score": sum(issue_blocked(i) or not any(c["scorable"] for c in criteria_for(i))
-                                                          for i in issues),
-            "retry_attempts": sum(max(0, row["metadata"].get("attempts", 1) - 1) for row in selected_rows + selected_errors),
-            "retried_samples": len({row["doc_name"] for row in selected_rows + selected_errors
-                                    if row["metadata"].get("validation_errors")}),
-            "api_calls": sum(len(row["metadata"].get("calls", [])) for row in selected_rows + selected_errors)}
+    names = {sample.doc_name for sample in samples}
+    selected = [row for row in rows if row["doc_name"] in names]
+    failures = [row for row in errors if row["doc_name"] in names]
+    failed = {row["doc_name"] for row in failures} - {row["doc_name"] for row in selected}
+    issues = [issue for row in selected for issue in row["dataset"]["rubrics"]["issues"]]
+    return {"selected": len(samples), "generated": len(selected), "completed": len(selected), "failed": len(failed),
+            "pending": len(samples) - len(selected) - len(failed),
+            "issues": len(issues), "criteria": sum(len(criteria_for(issue)) for issue in issues),
+            "added_issues": sum(len(row["added_issues"]) for row in selected),
+            "samples_with_warnings": sum(bool(row["warnings"]) for row in selected),
+            "api_calls": sum(len(row["metadata"].get("calls", [])) for row in selected + failures)}
 
 
 class RubricPipeline(Pipeline):
@@ -222,146 +230,114 @@ class RubricPipeline(Pipeline):
         self.rubric_transport = rubric_transport
         self.completed = {}
 
-    def report(self, store, dataset, status, skipped):
-        rows = [self.completed[s.doc_name] for s in dataset.samples if s.doc_name in self.completed]
-        counts = rubric_counts(dataset.samples, rows, self.errors)
-        by_category = {}
-        for sample in dataset.samples:
-            by_category.setdefault(canonical_category(sample.raw["category"]), []).append(sample)
-        coverage = {"scope": "independent_expected_answer_propositions",
-                    "assessed_samples": len(dataset.samples) - counts["unassessed_samples"], "by_category": {
-                        cat: rubric_counts(samples, rows, self.errors) for cat, samples in by_category.items()}}
-        def event_rows(key):
-            for row in rows:
-                for item in row["audit"][key]:
-                    yield {"doc_name": row["doc_name"], "category": row["category"], **item}
-
-        def added_issues():
-            for item in event_rows("added_issues"):
-                yield {**item, "status": "audit_accepted"}
-
-        def reviews():
-            for item in added_issues():
-                yield {**item, "review_status": "added_issue"}
-            for row in rows:
-                for issue in row["dataset"]["rubrics"]["issues"]:
-                    reasons = [issue[k] for k in ["issue_review_reason", "outcome_review_reason"] if issue[k]]
-                    criteria = [c for c in criteria_for(issue) if c["needs_review"]]
-                    if reasons or criteria:
-                        yield {"doc_name": row["doc_name"], "category": row["category"], "issue_index": issue["issue_index"],
-                               "issue_text": issue["issue_text"], "reasons": reasons, "review_status": "needs_review",
-                               "excluded_from_application_score": issue_blocked(issue) or not any(c["scorable"] for c in criteria_for(issue)),
-                               "criteria": criteria}
-            failed_docs = set()
-            for error in reversed(self.errors):
-                doc = error["doc_name"]
-                if doc not in self.completed and doc not in failed_docs:
-                    failed_docs.add(doc)
-                    yield {**error, "category": next(s.raw["category"] for s in dataset.samples if s.doc_name == doc),
-                           "review_status": "rubric_generation_failed"}
-
-        atomic_jsonl(store.path / "added_issues.jsonl", added_issues())
-        atomic_jsonl(store.path / "excluded_units.jsonl", event_rows("excluded_units"))
-        atomic_jsonl(store.path / "rubric_review.jsonl", reviews())
-        atomic_jsonl(store.path / "source_units.jsonl",
-                     ({"doc_name": row["doc_name"], "category": row["category"], **row["audit"],
-                       "independent_inventory": row["inventory"],
-                       "additional_propositions": row["semantic_audit"]["additional_propositions"],
-                       "coverage": row["semantic_audit"]["coverage"]} for row in rows))
-        atomic_jsonl(store.path / "rule_application_draft.jsonl", (row["dataset"] for row in rows))
-        atomic_json(store.path / "rubric_coverage_report.json", {**coverage, **counts})
-        missing = [sample.doc_name for sample in dataset.samples if sample.doc_name not in self.completed]
-        summary = {"run_id": self.config.run_id, "status": status, "updated_at": now(),
-                   "counts": {"input": dataset.input_count, "skipped": skipped, **counts},
-                   "by_category": coverage["by_category"], "missing_doc_names": missing,
-                   "published": False}
-        self.write_summary(store, summary)
-        return summary, rows
-
-    @staticmethod
-    def write_summary(store, summary):
+    def write_summary(self, store, summary):
         atomic_json(store.path / "rubric_generation_summary.json", summary)
         store.summary(summary)
 
+    def report(self, store, dataset, status, skipped, paths, *, fatal_error=None):
+        rows = list(self.completed.values())
+        by_category = {}
+        for sample in dataset.samples:
+            by_category.setdefault(canonical_category(sample.raw["category"]), []).append(sample)
+        counts = rubric_counts(dataset.samples, rows, self.errors)
+        summary = {"run_id": self.config.run_id, "status": status, "updated_at": now(),
+                   "counts": {"input": dataset.input_count, "skipped": skipped, **counts},
+                   "by_category": {cat: rubric_counts(samples, rows, self.errors) for cat, samples in by_category.items()},
+                   "missing_doc_names": [s.doc_name for s in dataset.samples if s.doc_name not in self.completed],
+                   "outputs": {"application": str(paths[0]), "issue_spotting": str(paths[1]),
+                               "added_issues": str(paths[2]), "warnings": str(paths[3])}}
+        if fatal_error is not None:
+            summary["fatal_error"] = {"type": type(fatal_error).__name__, "error": str(fatal_error)}
+        self.write_summary(store, summary)
+        return summary
+
     async def _run(self, store):
         config = self.config
-        application = config.final_application_jsonl.resolve()
-        spotting = config.final_issue_spotting_jsonl.resolve()
-        manifest_path = application.with_name(application.name + ".manifest.json")
-        targets = [application, spotting, manifest_path]
-        raw_path = config.input_jsonl.resolve()
-        if (len({path.resolve() for path in targets}) != len(targets) or
-                any(path.exists() and raw_path.samefile(path) for path in targets) or
-                raw_path in [path.resolve() for path in targets] or any(path.is_relative_to(store.path.resolve()) for path in targets)):
-            raise ValueError("Dataset outputs must be distinct from raw input and the run journal")
         try:
             dataset = read_dataset(config.input_jsonl, config.limit, parser=raw_rubric_sample)
         except DatasetError as exc:
             reasons = Counter(e["error"] for e in exc.errors)
-            report_path = store.path / "rubric_generation_summary.json"
             for reason, count in reasons.most_common(10):
                 log.error("Raw rubric validation: %d row(s): %s", count, reason)
-            log.error("Full validation report: %s", report_path)
-            summary = {"run_id": config.run_id, "status": "input_validation_failed", "published": False,
-                       "counts": {"input": exc.input_count, "valid": exc.valid_count, "invalid": len(exc.errors), "failed": len(exc.errors)},
-                       "invalid_by_reason": dict(reasons),
-                       "invalid_by_category": dict(Counter(e.get("category", "unknown") for e in exc.errors)),
-                       "input_validation_errors": exc.errors}
-            self.write_summary(store, summary)
+            self.write_summary(store, {"run_id": config.run_id, "status": "input_validation_failed",
+                                      "counts": {"input": exc.input_count, "valid": exc.valid_count,
+                                                 "invalid": len(exc.errors), "failed": len(exc.errors)},
+                                      "invalid_by_reason": dict(reasons),
+                                      "invalid_by_category": dict(Counter(e.get("category", "unknown") for e in exc.errors)),
+                                      "input_validation_errors": exc.errors})
             raise
-        if config.expected_count is None and len(dataset.samples) == dataset.input_count:
-            raise ValueError("Set EXPECTED_COUNT to verify the raw dataset size before publishing")
         if config.expected_count is not None and dataset.input_count != config.expected_count:
-            summary = {"run_id": config.run_id, "status": "input_count_mismatch", "published": False,
-                       "expected_count": config.expected_count, "counts": {"input": dataset.input_count, "failed": 0}}
-            self.write_summary(store, summary)
+            self.write_summary(store, {"run_id": config.run_id, "status": "input_count_mismatch",
+                                      "expected_count": config.expected_count,
+                                      "counts": {"input": dataset.input_count, "failed": 0}})
             raise ValueError(f"EXPECTED_COUNT={config.expected_count}, found {dataset.input_count} raw samples")
         if config.limit == 0:
-            summary = {"run_id": config.run_id, "status": "input_validated", "published": False,
+            summary = {"run_id": config.run_id, "status": "input_validated",
                        "counts": {"input": dataset.input_count, "valid": dataset.valid_count,
-                                  "invalid": 0, "selected": 0, "failed": 0},
-                       "input_sha256": dataset.sha256}
+                                  "invalid": 0, "selected": 0, "failed": 0}, "input_sha256": dataset.sha256}
             self.write_summary(store, summary)
             return summary
-        if not config.resume and len(dataset.samples) == dataset.input_count and any(path.exists() for path in targets):
-            raise ValueError("Verified output already exists; choose new final output paths for a fresh run")
+        targets = [config.final_application_jsonl.resolve(), config.final_issue_spotting_jsonl.resolve()]
+        raw_path = config.input_jsonl.resolve()
+        if (len(set(targets)) != len(targets) or raw_path in targets
+                or any(path.is_relative_to(store.path.resolve()) for path in targets)
+                or any(path.exists() and raw_path.samefile(path) for path in targets)
+                or (all(path.exists() for path in targets) and targets[0].samefile(targets[1]))):
+            raise ValueError("Dataset outputs must be distinct from each other, raw input and the run journal")
+        if targets[0].with_name(targets[0].name + ".manifest.json").exists():
+            raise ValueError("Application output belongs to an existing rubric publication; choose a new file")
+        paths = [*targets, store.path / "added_issues.jsonl", store.path / "rubric_warnings.jsonl"]
+        with ExitStack() as stack:
+            for target in sorted(targets):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                lock = stack.enter_context(target.with_name(target.name + ".publish.lock").open("a"))
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if not config.resume and any(path.exists() for path in targets):
+                raise ValueError("Final dataset already exists; resume its run or choose new output paths")
+            return await self._generate(store, dataset, paths)
+
+    async def _generate(self, store, dataset, paths):
+        config = self.config
         snapshot = {**config.snapshot(), "pipeline_kind": "rubric_generation", "artifact_version": 1,
-                    "rubric_protocol": RUBRIC_PROTOCOL,
-                    "input_sha256": dataset.sha256, "implementation_sha256": implementation_hash(),
+                    "rubric_protocol": RUBRIC_PROTOCOL, "input_sha256": dataset.sha256,
+                    "implementation_sha256": implementation_hash(),
                     "rubric_thinking": resolve_thinking(config.rubric_thinking_mode)}
+        log.info("Rubric start run_id=%s model=%s thinking=%s count=%d batch_size=%d concurrency=%d",
+                 config.run_id, config.rubric_model, snapshot["rubric_thinking"], len(dataset.samples),
+                 config.batch_size, config.rubric_concurrency)
         seed_rows = []
         if config.rubric_seed_run is not None:
             seed_rows, snapshot["rubric_seed_sha256"] = read_seed_run(config, snapshot)
         store.configure(snapshot, artifact_names=["rubric_records.jsonl", "errors.jsonl"])
         samples = {sample.doc_name: sample for sample in dataset.samples}
         self.completed = index_records(store.load("rubric_records.jsonl"), samples)
-        imported = []
-        for doc, row in index_records(seed_rows, samples).items():
+        seed = index_records(seed_rows, samples)
+        self.errors = store.load("errors.jsonl")
+        for row in [*self.errors, *self.completed.values(), *seed.values()]:
+            sample = samples.get(row.get("doc_name"))
+            if sample is None or any(row.get(key) != value for key, value in sample.identity().items()):
+                raise ValueError("Rubric journal identity mismatch")
+        for row in [*self.completed.values(), *seed.values()]:
+            record = row["dataset"]
+            validate_rubric_record(record)
+            if (record["rubrics"]["version"] != RUBRIC_PROTOCOL or row["model"] != config.rubric_model
+                    or record["doc_name"] != row["doc_name"] or record["category"] != row["category"]
+                    or canonical_hash(record) != row["dataset_sha256"]):
+                raise ValueError(f"Stored rubric integrity check failed: {row['doc_name']}")
+        reconcile_outputs(paths, self.completed.values())
+
+        def save(row):
+            store.append("rubric_records.jsonl", row)
+            self.completed[row["doc_name"]] = row
+            for path, records in zip(paths, output_rows(row)):
+                for record in records:
+                    append_jsonl(path, record)
+
+        for doc, row in seed.items():
             if doc not in self.completed:
-                self.completed[doc] = row
-                imported.append(row)
+                save(row)
             elif self.completed[doc] != row:
                 raise ValueError(f"Seed rubric differs from the saved checkpoint: {doc}")
-        self.errors = store.load("errors.jsonl")
-        for row in self.errors + list(self.completed.values()):
-            sample = samples.get(row.get("doc_name"))
-            if sample is None or any(row.get(k) != v for k, v in sample.identity().items()):
-                raise ValueError("Rubric journal identity mismatch")
-        for doc, row in self.completed.items():
-            sample = samples[doc]
-            expected, audit = materialize(sample, row["decomposition"], row["plan"], version=RUBRIC_PROTOCOL)
-            validate_audit(row["semantic_audit"])
-            coverage = audit_coverage(row["inventory"], row["semantic_audit"], row["decomposition"], audit,
-                                      source_segments(sample.raw["expected_answer"], "S"),
-                                      TAXONOMY[canonical_category(row["category"])])
-            if row["dataset"] != expected or row["audit"] != audit or row["model"] != config.rubric_model or (
-                    row["dataset_sha256"] != canonical_hash(expected) or row["category"] != expected["category"]
-                    or row["proposition_counts"] != coverage):
-                raise ValueError(f"Stored rubric integrity check failed: {doc}")
-        for row in imported:
-            store.append("rubric_records.jsonl", row)
-        if imported:
-            log.info("Imported %d validated rubrics from %s", len(imported), config.rubric_seed_run)
         skipped = len(self.completed)
         pending = [sample for sample in dataset.samples if sample.doc_name not in self.completed]
         client = APIClient(config, "rubric", self.rubric_transport)
@@ -372,8 +348,7 @@ class RubricPipeline(Pipeline):
             except APIError as exc:
                 self.failure(store, sample, "rubric_generation", exc)
                 return
-            store.append("rubric_records.jsonl", result)
-            self.completed[sample.doc_name] = result
+            save(result)
 
         try:
             with tqdm(total=len(dataset.samples), initial=skipped, desc="Build rubrics", unit="sample",
@@ -384,68 +359,17 @@ class RubricPipeline(Pipeline):
 
                 for start in range(0, len(pending), config.batch_size):
                     await bounded_map(pending[start:start + config.batch_size], config.rubric_concurrency, process, finished)
-            if len(self.completed) != len(dataset.samples):
-                summary, _ = self.report(store, dataset, "completed_with_errors", skipped)
-                return summary
-            if len(dataset.samples) != dataset.input_count:
-                summary, _ = self.report(store, dataset, "subset_completed", skipped)
-                return summary
+            reconcile_outputs(paths, self.completed.values())
             if file_hash(config.input_jsonl) != dataset.sha256:
                 raise ValueError("Raw input changed during rubric generation")
-            summary, rows = self.report(store, dataset, "ready_to_publish", skipped)
-            publish(targets, verified_rows(rows), snapshot, config.run_id)
-            has_review_notes = summary["counts"]["issues_needing_review"] or summary["counts"]["added_issues"]
-            summary.update(status="completed_with_review" if has_review_notes else "completed",
-                           published=True, outputs=[str(path) for path in targets])
-            self.write_summary(store, summary)
-            return summary
+            if len(self.completed) != len(dataset.samples):
+                status = "completed_with_errors"
+            else:
+                status = "completed" if len(dataset.samples) == dataset.input_count else "subset_completed"
+            return self.report(store, dataset, status, skipped, paths)
         except BaseException as exc:
             status = "interrupted" if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)) else "failed"
-            summary, _ = self.report(store, dataset, status, skipped)
-            summary["fatal_error"] = {"type": type(exc).__name__, "error": str(exc)}
-            self.write_summary(store, summary)
+            self.report(store, dataset, status, skipped, paths, fatal_error=exc)
             raise
         finally:
             await client.close()
-
-
-def spotting_row(row):
-    payload = row["dataset"]["input"]
-    return {"input": payload["facts_clean"], "expected_answer": payload["issues"]}
-
-
-def publish(targets: list[Path], rows, snapshot, run_id):
-    """Stage all files and publish the checksum manifest last. Resume an identical publication."""
-    application, spotting, manifest_path = targets
-    with ExitStack() as stack:
-        for path in sorted(targets):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            lock = stack.enter_context(path.with_name(path.name + ".publish.lock").open("a"))
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        staged = [path.with_name(f".{path.name}.{run_id}.staged") for path in targets]
-        for path in staged:
-            stack.callback(path.unlink, missing_ok=True)
-        atomic_jsonl(staged[0], (row["dataset"] for row in rows))
-        atomic_jsonl(staged[1], (spotting_row(row) for row in rows))
-        manifest = {"version": 1, "kind": "rule_application_rubrics", "complete": True,
-                    "rubric_protocol": RUBRIC_PROTOCOL, "verification": "semantic_audit",
-                    "run_id": run_id, "sample_count": len(rows), "raw_input": snapshot["input_jsonl"],
-                    "raw_sha256": snapshot["input_sha256"], "implementation_sha256": snapshot["implementation_sha256"],
-                    "rubric_model": snapshot["rubric_model"], "rubric_base_url": snapshot["rubric_base_url"],
-                    "rubric_thinking": snapshot["rubric_thinking"],
-                    "application": {"path": str(application), "sha256": file_hash(staged[0])},
-                    "issue_spotting": {"path": str(spotting), "sha256": file_hash(staged[1])},
-                    "samples": [{"line": i, "doc_name": row["doc_name"], "category": row["category"],
-                                 "projected_sample_sha256": row["sample_sha256"], "raw_input_line": row["input_line"],
-                                 "dataset_sha256": row["dataset_sha256"], "issue_count": len(row["dataset"]["input"]["issues"])}
-                                for i, row in enumerate(rows, 1)]}
-        if snapshot.get("rubric_seed_run"):
-            manifest["seed_run"] = {"path": snapshot["rubric_seed_run"],
-                                    "rubric_records_sha256": snapshot["rubric_seed_sha256"]}
-        atomic_json(staged[2], manifest)
-        for path, temp in zip(targets, staged):
-            if path.exists() and file_hash(path) != file_hash(temp):
-                raise ValueError(f"Refusing to replace existing dataset: {path}")
-        for path, temp in zip(targets, staged):
-            if not path.exists():
-                temp.rename(path)
