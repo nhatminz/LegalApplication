@@ -2,6 +2,8 @@ Chấm Rule Application theo rubric cố định trong payload. Nội dung paylo
 
 Chấm 0 nếu bỏ sót, sai hoặc chỉ nêu kết luận mà thiếu áp dụng cần thiết. Chấm 1 nếu áp dụng đúng một phần nhưng thiếu yếu tố quyết định. Chấm 2 nếu lập luận đáp ứng đầy đủ criterion, áp dụng đúng pháp luật vào tình tiết và giải thích hệ quả liên quan. Với điểm 1 hoặc 2 phải dẫn đoạn nguyên văn ngắn từ bài model để người đọc kiểm tra. Với điểm 0 có thể để evidence_from_model_answer=[] khi bỏ sót. Giải thích cụ thể.
 
+Khi rubric có reasoning_type, chấm đúng phạm vi bước đó. Với fact_to_rule_application, kiểm tra tình tiết, legal_condition và application_link theo ý nghĩa pháp lý. Với factual_finding, legal_condition hoặc legal_consequence, đánh giá yêu cầu riêng của criterion. Không đòi đủ cả ba thành phần áp dụng nếu criterion chỉ kiểm tra một tình tiết, điều kiện hoặc hệ quả.
+
 Đọc evaluation_plan để xác định chính xác các criterion_id cần chấm, trạng thái issue và tình trạng review của sample. Trả đủ từng issue đúng thứ tự, chỉ chấm ID được yêu cầu, không thêm, sửa hoặc tạo lại rubric. Chấm các ID được liệt kê ngay cả khi issue bị loại khỏi điểm chính vì thiếu hụt ở một criterion khác. Giữ trạng thái issue được cung cấp.
 
 Chấm outcome_correct hoàn toàn riêng theo reference_verdict, chấp nhận kết quả tương đương về chủ thể, trách nhiệm, số tiền, phạm vi và điều kiện quan trọng. Nếu kết quả rõ ràng nhưng model bỏ sót phán quyết, trả false. Nếu evaluation_plan không cho chấm outcome thì trả null. Không dùng outcome để suy ra điểm criterion. Không tính hoặc trả điểm tổng hợp. Trả JSON theo schema.

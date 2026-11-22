@@ -55,7 +55,35 @@ def artifacts(raw, *, add=False, missing=False):
                                      "reason": "Gold issue chỉ nói về nghĩa vụ trả nợ"})
         plan["assignments"].append({**assignment, "unit_id": "U3", "issue_index": 2, "criterion": "Giải quyết yêu cầu độc lập"})
         plan["issues"].append({**outcome, "issue_index": 2})
+    for unit in unit_rows:
+        unit.update(reasoning_type="fact_to_rule_application" if unit["unit_id"] == "U1" else "legal_consequence",
+                    group_id=group, group_rationale=None,
+                    evidence=[{"source_id": sid, "quote": source[sid].strip()} for sid in unit["source_ids"]])
+    for row in plan["assignments"]:
+        row.update(group_adjustment_reason=None, legal_condition="Có nghĩa vụ trả khoản nợ đã xác nhận",
+                   application_link="Việc xác nhận khoản nợ làm phát sinh nghĩa vụ hoàn trả")
+    for proposed in plan["added_issues"]:
+        proposed["why_existing_issues_do_not_cover"] = "Issue về khoản nợ không giải quyết yêu cầu độc lập này."
     return sample, {"units": unit_rows, "non_reasoning": []}, plan
+
+
+def fixture_inventory(dec):
+    return {"propositions": [{**unit, "unit_id": "P" + unit["unit_id"][1:]} for unit in dec["units"]],
+            "non_reasoning": dec["non_reasoning"]}
+
+
+def fixture_audit(dec, plan, *, stage=None, problems=()):
+    mapped = {r["unit_id"] for r in plan["assignments"]}
+    return {"approved": stage is None, "repair_stage": stage, "problems": list(problems), "additional_propositions": [],
+            "coverage": [{"proposition_id": "P" + unit["unit_id"][1:],
+                          "status": "mapped" if unit["unit_id"] in mapped else "excluded",
+                          "unit_id": unit["unit_id"], "reason": "Đã đối chiếu theo phạm vi."}
+                         for unit in dec["units"]]}
+
+
+def request_stage(schema):
+    return next(name for field, name in [("units", "decompose"), ("assignments", "map"),
+                                         ("propositions", "inventory"), ("coverage", "audit")] if field in schema)
 
 
 def run_build(config, handler):
@@ -149,14 +177,16 @@ def test_build_retry_resume_paired_publish_and_evaluate(config_factory, tmp_path
         assert "".join(payload["expected_answer_segments"].values()) == ANSWER
         schema = body["response_format"]["json_schema"]["schema"]["properties"]
         _, dec, plan = artifacts(raw, add=raw["doc_name"] == "first", missing=raw["doc_name"] == "second")
-        stage = "decompose" if "units" in schema else "map" if "assignments" in schema else "audit"
+        stage = request_stage(schema)
         calls.append((raw["doc_name"], stage))
         approved = not (reject_second and raw["doc_name"] == "second")
         if stage == "audit":
             assert payload["plan"] == plan
-        value = {"decompose": dec, "map": plan,
-                 "audit": {"approved": approved, "problems": [] if approved else ["Unit U2 excluded without adequate reasoning"],
-                           "repair_stage": None if approved else "map"}}[stage]
+        if stage == "inventory":
+            assert not {"decomposition", "plan", "issues"} & payload.keys()
+        value = {"decompose": dec, "map": plan, "inventory": fixture_inventory(dec),
+                 "audit": fixture_audit(dec, plan, stage=None if approved else "map",
+                                        problems=[] if approved else ["Unit U2 excluded without adequate reasoning"])}[stage]
         return httpx.Response(200, json=envelope(json.dumps(value, ensure_ascii=False)))
 
     first = run_build(config, rubric)
@@ -166,8 +196,13 @@ def test_build_retry_resume_paired_publish_and_evaluate(config_factory, tmp_path
     calls.clear()
     reject_second = False
     complete = run_build(replace(config, resume=True), rubric)
-    assert calls == [("second", stage) for stage in ("decompose", "map", "audit")]
-    assert complete["published"] and complete["counts"]["skipped"] == 1
+    assert calls == [("second", stage) for stage in ("decompose", "map", "inventory", "audit")]
+    assert complete["status"] == "completed_with_review" and complete["counts"]["skipped"] == 1
+    assert complete["published"] and complete["counts"]["added_issues"] == 1
+    assert not (config.run_dir / "issue_decisions.jsonl").exists()
+    draft = read_jsonl(config.run_dir / "rule_application_draft.jsonl")[0]
+    with pytest.raises(ValueError, match="Draft rubric dataset"):
+        rubric_sample(draft, 0)
     assert complete["counts"]["issues_needing_review"] == 1
     assert complete["counts"]["samples_with_added_issues"] == 1
     assert complete["counts"]["rubric_coverage"] == 1
@@ -177,10 +212,17 @@ def test_build_retry_resume_paired_publish_and_evaluate(config_factory, tmp_path
     assert [row["doc_name"] for row in rows] == ["first", "second"]
     assert spots == [{"input": row["input"]["facts_clean"], "expected_answer": row["input"]["issues"]} for row in rows]
     added = read_jsonl(config.run_dir / "added_issues.jsonl")
+    assert added[0]["status"] == "audit_accepted"
     assert added[0]["new_issue"] == spots[0]["expected_answer"][-1] and added[0]["doc_name"] == "first"
+    notes = read_jsonl(config.run_dir / "rubric_review.jsonl")
+    assert notes[0] == {**added[0], "review_status": "added_issue"}
+    assert notes[1]["review_status"] == "needs_review" and notes[1]["doc_name"] == "second"
+    assert notes[1]["excluded_from_application_score"] is True
     assert len(read_jsonl(config.run_dir / "excluded_units.jsonl")) == 2
     assert len(read_jsonl(config.run_dir / "source_units.jsonl")) == 2
-    assert json.loads(application.with_name(application.name + ".manifest.json").read_text())["sample_count"] == 2
+    manifest = json.loads(application.with_name(application.name + ".manifest.json").read_text())
+    assert manifest["sample_count"] == 2 and manifest["verification"] == "semantic_audit"
+    assert "issue_decisions" not in manifest
 
     accessed = []
     def generate(request):
@@ -301,7 +343,7 @@ def test_rubric_repair_uses_verified_source_ids_and_retries_only_required_stage(
     def rubric(request):
         body = json.loads(request.content)
         schema = body["response_format"]["json_schema"]["schema"]["properties"]
-        stage = "decompose" if "units" in schema else "map" if "assignments" in schema else "audit"
+        stage = request_stage(schema)
         system = body["messages"][0]["content"]
         payload = json.loads(body["messages"][1]["content"])
         calls.append(stage)
@@ -322,17 +364,19 @@ def test_rubric_repair_uses_verified_source_ids_and_retries_only_required_stage(
             if calls.count(stage) == 3:
                 assert "Cần sửa U1" in system
                 assert ("previous_attempt" in payload) == (repair_stage == "map")
+        elif stage == "inventory":
+            value = fixture_inventory(dec)
         else:
             outcome = payload["plan"]["issues"][0]
             assert outcome["verdict_source_ids"] == list(payload["expected_answer_segments"])
             assert outcome["issue_review_reason"] == plan["assignments"][0]["review_reason"]
             approved = calls.count(stage) > 1
-            value = {"approved": approved, "problems": [] if approved else ["Cần sửa U1"],
-                     "repair_stage": None if approved else repair_stage}
+            value = fixture_audit(dec, plan, stage=None if approved else repair_stage,
+                                  problems=[] if approved else ["Cần sửa U1"])
         return httpx.Response(200, json=envelope(json.dumps(value, ensure_ascii=False)))
 
     assert run_build(config, rubric)["published"]
-    assert calls == ["decompose", "map", "map", "audit", *(["decompose"] if repair_stage == "decompose" else []), "map", "audit"]
+    assert calls == ["decompose", "map", "map", "inventory", "audit", *(["decompose"] if repair_stage == "decompose" else []), "map", "audit"]
     saved = read_jsonl(config.run_dir / "rubric_records.jsonl")[0]
     assert saved["metadata"]["retry_stages"] == [
         {"failed_stage": "map", "retry_stage": "map"}, {"failed_stage": "audit", "retry_stage": repair_stage}]
@@ -355,15 +399,12 @@ def test_retry_into_new_run_replays_completed_rubric_and_only_calls_failed_sampl
             return httpx.Response(503)
         _, dec, plan = artifacts(next(row for row in rows if row["category"] == payload["category"]))
         fields = body["response_format"]["json_schema"]["schema"]["properties"]
-        value = (dec if "units" in fields else plan if "assignments" in fields
-                 else {"approved": True, "problems": [], "repair_stage": None})
+        value = {"decompose": dec, "map": plan, "inventory": fixture_inventory(dec),
+                 "audit": fixture_audit(dec, plan)}[request_stage(fields)]
         return httpx.Response(200, json=envelope(json.dumps(value, ensure_ascii=False)))
 
     assert run_build(cfg, judge)["counts"]["completed"] == 1
     source = cfg.run_dir / "rubric_records.jsonl"
-    saved = read_jsonl(source)[0]
-    saved["semantic_audit"].pop("repair_stage")  # Older approved audit records omit this field.
-    source.write_text(json.dumps(saved, ensure_ascii=False) + "\n", encoding="utf-8")
     original = source.read_bytes()
     old_snapshot_path = cfg.run_dir / "config.json"
     snapshot = json.loads(old_snapshot_path.read_text())
@@ -373,7 +414,7 @@ def test_retry_into_new_run_replays_completed_rubric_and_only_calls_failed_sampl
     seen.clear()
     recovery = replace(cfg, run_id="rubric-retry", rubric_seed_run=cfg.run_dir)
     summary = run_build(recovery, judge)
-    assert seen == ["Commercial"] * 3
+    assert seen == ["Commercial"] * 4
     assert summary["published"] and summary["counts"]["skipped"] == 1
     assert source.read_bytes() == original
     assert read_jsonl(recovery.run_dir / "rubric_records.jsonl")[0] == read_jsonl(source)[0]
@@ -442,3 +483,134 @@ def test_rubric_resume_helper_restores_raw_input_and_settings(config_factory, mo
     assert restored.run_id == ("new-run" if retry_into else cfg.run_id)
     assert restored.input_jsonl == cfg.input_jsonl
     assert restored.rubric_concurrency == 11 and restored.expected_count == 1
+
+
+def test_atomic_grounding_and_group_adjustments_are_validated():
+    sample, dec, plan = artifacts(raw_record())
+    original = sample.raw["input"]["facts_clean"]
+    broken = deepcopy(plan)
+    broken["assignments"][0]["rule_indices"] = []
+    with pytest.raises(ValueError, match="Fact-to-Rule needs input facts and rules"):
+        materialize(sample, dec, broken, version=2)
+    broken["assignments"][0].update(missing_information=["Thiếu quy định quyết định nghĩa vụ"], decisive=True,
+                                    review_reason="Input không chứa quy định được viện dẫn")
+    record, _ = materialize(sample, dec, broken, version=2)
+    issue = record["rubrics"]["issues"][0]
+    criterion = issue["groups"][0]["criteria"][0]
+    assert criterion["needs_review"] and not criterion["scorable"]
+    assert evaluation_plan(replace(sample, raw=record))["issues"][0]["application_scorable"] is False
+    assert record["input"]["facts_clean"] == original
+
+    wrong_group = deepcopy(plan)
+    wrong_group["assignments"][0]["group_id"] = "obligations"
+    with pytest.raises(ValueError, match="group_adjustment_reason"):
+        materialize(sample, dec, wrong_group, version=2)
+    wrong_group["assignments"][0]["group_adjustment_reason"] = "Bước này xác lập nghĩa vụ thanh toán."
+    moved, _ = materialize(sample, dec, wrong_group, version=2)
+    assert moved["rubrics"]["issues"][0]["groups"][0]["group_id"] == "obligations"
+    wrong_source = deepcopy(dec)
+    wrong_source["units"][0]["evidence"][0]["quote"] = "B ký nhận hai tỷ đồng."
+    with pytest.raises(ValueError, match="verbatim"):
+        materialize(sample, wrong_source, plan, version=2)
+
+
+@pytest.mark.parametrize("bad_link", ["duplicate", "disjoint", "missing"])
+def test_independent_coverage_blocks_reuse_or_wrong_evidence_within_one_segment(bad_link):
+    from legal_application.rubric_quality import audit_coverage
+
+    sample, dec, plan = artifacts(raw_record())
+    sources = source_segments(sample.raw["expected_answer"], "S")
+    dec["units"][0]["evidence"][0]["quote"] = "B ký nhận nợ"
+    dec["units"][1]["evidence"][0]["quote"] = "B phải trả 100 đồng"
+    _, audit = materialize(sample, dec, plan, version=2)
+    audit_inventory = fixture_inventory(dec)
+    decision = fixture_audit(dec, plan)
+    first, second = decision["coverage"]
+    if bad_link == "duplicate":
+        second.update(unit_id="U1", status="mapped")
+        message = "one unit cannot cover multiple atomic propositions"
+    elif bad_link == "disjoint":
+        first.update(unit_id="U2", status="excluded")
+        second.update(unit_id="U1", status="mapped")
+        message = "overlap verbatim evidence"
+    else:
+        first.update(unit_id=None, status="missing")
+        message = "cannot approve with missing"
+    with pytest.raises(ValueError, match=message):
+        audit_coverage(audit_inventory, decision, dec, audit, sources, TAXONOMY["Civil"])
+
+
+@pytest.mark.parametrize("inventoried", [True, False])
+def test_same_segment_missing_reasoning_is_counted_and_requests_decomposition_repair(config_factory, tmp_path, inventoried):
+    raw = raw_record()
+    sample, dec, plan = artifacts(raw)
+    dec["units"][0]["evidence"][0]["quote"] = "B ký nhận nợ"
+    extra = {**dec["units"][0], "unit_id": "P3", "reasoning": "Tòa xác định phải trả 100 đồng",
+             "reasoning_type": "legal_consequence",
+             "evidence": [{"source_id": "S1", "quote": "B phải trả 100 đồng"}]}
+    inventory = fixture_inventory(dec)
+    if inventoried:
+        inventory["propositions"].append(extra)
+    bad = fixture_audit(dec, plan, stage="decompose", problems=["S1 còn thiếu nhận định phải trả 100 đồng"])
+    if not inventoried:
+        bad["additional_propositions"] = [extra]
+    bad["coverage"].append({"proposition_id": "P3", "status": "missing", "unit_id": None,
+                            "reason": "Unit hiện tại chỉ xác định giấy ký nhận, chưa có hệ quả."})
+    cfg = config_factory([raw], mode="build-rubrics", expected_count=1, rubric_json_retries=0,
+                         final_application_jsonl=tmp_path / "application.jsonl",
+                         final_issue_spotting_jsonl=tmp_path / "spotting.jsonl")
+
+    def reply(request):
+        body = json.loads(request.content)
+        fields = body["response_format"]["json_schema"]["schema"]["properties"]
+        stage = request_stage(fields)
+        if stage == "inventory":
+            assert "decomposition" not in json.loads(body["messages"][1]["content"])
+        return httpx.Response(200, json=envelope(json.dumps({"decompose": dec, "map": plan,
+                                                             "inventory": inventory, "audit": bad}[stage])))
+
+    summary = run_build(cfg, reply)
+    assert set(sources_id for unit in dec["units"] for sources_id in unit["source_ids"]) == {"S1"}
+    assert summary["counts"]["missing_propositions"] == 1
+    assert summary["counts"]["rubric_coverage"] is None and not summary["published"]
+    error = read_jsonl(cfg.run_dir / "errors.jsonl")[0]
+    assert error["metadata"]["proposition_audit"]["dispositions"][-1]["status"] == "missing"
+    assert not cfg.final_application_jsonl.exists() and not cfg.final_issue_spotting_jsonl.exists()
+
+
+def test_unnecessary_added_issue_is_remapped_and_reaudited(config_factory, tmp_path):
+    raw = raw_record()
+    _, dec, draft = artifacts(raw, add=True)
+    draft["added_issues"][0]["issue_text"] = "B có phải hoàn trả nghĩa vụ tiền đã cam kết?"
+    repaired = deepcopy(draft)
+    repaired["added_issues"] = []
+    repaired["issues"].pop()
+    repaired["assignments"][-1]["issue_index"] = 1
+    cfg = config_factory([raw], mode="build-rubrics", expected_count=1, rubric_json_retries=1,
+                         final_application_jsonl=tmp_path / "application.jsonl",
+                         final_issue_spotting_jsonl=tmp_path / "spotting.jsonl")
+    calls = []
+
+    def reply(request):
+        body = json.loads(request.content)
+        fields = body["response_format"]["json_schema"]["schema"]["properties"]
+        payload = json.loads(body["messages"][1]["content"])
+        stage = request_stage(fields)
+        calls.append(stage)
+        if stage == "decompose":
+            value = dec
+        elif stage == "inventory":
+            value = fixture_inventory(dec)
+        elif stage == "map":
+            value = repaired if "previous_attempt" in payload else draft
+        else:
+            if payload["plan"]["added_issues"]:
+                value = fixture_audit(dec, draft, stage="map", problems=["Issue gốc Q1 đã bao phủ đề xuất Q2."])
+            else:
+                value = fixture_audit(dec, repaired)
+        return httpx.Response(200, json=envelope(json.dumps(value, ensure_ascii=False)))
+
+    complete = run_build(cfg, reply)
+    assert complete["published"] and complete["counts"]["added_issues"] == 0
+    assert calls == ["decompose", "map", "inventory", "audit", "map", "audit"]
+    assert read_jsonl(cfg.final_issue_spotting_jsonl)[0]["expected_answer"] == raw["issues"]

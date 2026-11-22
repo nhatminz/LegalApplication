@@ -24,6 +24,51 @@
               "minLength": 1
             },
             "minItems": 1
+          },
+          "reasoning_type": {
+            "enum": [
+              "factual_finding",
+              "legal_condition",
+              "fact_to_rule_application",
+              "legal_consequence"
+            ]
+          },
+          "group_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "group_rationale": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "source_id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "quote": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "source_id",
+                "quote"
+              ]
+            },
+            "minItems": 1
           }
         },
         "required": [

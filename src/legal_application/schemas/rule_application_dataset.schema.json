@@ -78,7 +78,8 @@
       "properties": {
         "version": {
           "enum": [
-            1
+            1,
+            2
           ]
         },
         "issues": {
@@ -182,6 +183,36 @@
                           },
                           "decisive": {
                             "type": "boolean"
+                          },
+                          "reasoning_type": {
+                            "enum": [
+                              "factual_finding",
+                              "legal_condition",
+                              "fact_to_rule_application",
+                              "legal_consequence"
+                            ]
+                          },
+                          "legal_condition": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "application_link": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
                           }
                         },
                         "required": [
@@ -263,6 +294,12 @@
             ]
           },
           "minItems": 1
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "verified"
+          ]
         }
       },
       "required": [

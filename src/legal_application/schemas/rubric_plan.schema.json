@@ -24,6 +24,10 @@
               "minLength": 1
             },
             "minItems": 1
+          },
+          "why_existing_issues_do_not_cover": {
+            "type": "string",
+            "minLength": 1
           }
         },
         "required": [
@@ -104,6 +108,39 @@
           },
           "decisive": {
             "type": "boolean"
+          },
+          "group_adjustment_reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "legal_condition": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "application_link": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [

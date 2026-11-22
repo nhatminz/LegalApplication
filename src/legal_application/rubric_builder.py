@@ -16,8 +16,9 @@ from .api import APIClient, APIError, IncompleteResponse
 from .data import DatasetError, canonical_hash, read_dataset, strict_json, text_field
 from .pipeline import Pipeline, bounded_map, index_records
 from .prompts import prompt_text
+from .rubric_quality import AUDIT_V2, INVENTORY_SCHEMA, audit_coverage, extend_inventory, validate_inventory, verified_rows
 from .rubric_taxonomy import CIVIL_ANCHOR, PROCEDURAL_ANCHORS, TAXONOMY, canonical_category
-from .rubrics import (AUDIT_SCHEMA, DECOMPOSITION_SCHEMA, PLAN_SCHEMA, criteria_for, issue_blocked, materialize,
+from .rubrics import (AUDIT_SCHEMA, DECOMPOSITION_V2, PLAN_V2, RUBRIC_PROTOCOL, criteria_for, issue_blocked, materialize,
                       raw_rubric_sample, require_schema, resolve_verdict_ids, source_segments, validate_decomposition)
 from .storage import atomic_json, atomic_jsonl, file_hash, implementation_hash, now, read_jsonl
 from .thinking import resolve_thinking
@@ -45,21 +46,22 @@ class AuditRejected(ValueError):
 async def build_sample(config, sample, client) -> dict:
     raw = sample.raw
     category = canonical_category(raw["category"])
+    taxonomy = TAXONOMY[category]
     source = source_segments(raw["expected_answer"], "S")
-    common = {"category": category, "expected_answer_segments": source, "taxonomy": TAXONOMY[category],
+    common = {"category": category, "expected_answer_segments": source, "taxonomy": taxonomy,
               "analysis_reference": PROCEDURAL_ANCHORS.get(category, CIVIL_ANCHOR),
               "instance_level": raw.get("instance_level"), "code": raw.get("code")}
     context = {**common, **raw["input"], "facts_clean_segments": source_segments(raw["input"]["facts_clean"], "F")}
 
     # Constrain verdict IDs at generation time. The materializer can still resolve a
     # known U ID safely when an endpoint returns a JSON object without enforcing this enum.
-    map_schema = deepcopy(PLAN_SCHEMA)
+    map_schema = deepcopy(PLAN_V2)
     verdict_ids = map_schema["properties"]["issues"]["items"]["properties"]["verdict_source_ids"]
     verdict_ids["items"]["enum"] = list(source)
-    audit_schema = {**AUDIT_SCHEMA, "required": [*AUDIT_SCHEMA["required"], "repair_stage"]}
-    calls, errors, retries, drafts = [], [], [], {}
+    calls, errors, retries, drafts, proposal_attempts = [], [], [], {}, []
     stage, repair = "decompose", None
     mapping_feedback = None
+    inventory, coverage, coverage_details = None, None, None
     attempt = 0
 
     async def request(schema, payload, *, validator_schema=None):
@@ -79,15 +81,25 @@ async def build_sample(config, sample, client) -> dict:
     while True:
         try:
             if stage == "decompose":
-                decomposition = await request(DECOMPOSITION_SCHEMA, common)
-                units = validate_decomposition(decomposition, source)
+                decomposition = await request(DECOMPOSITION_V2, common)
+                units = validate_decomposition(decomposition, source, taxonomy=taxonomy)
                 stage, repair = "map", mapping_feedback
                 mapping_feedback = None
                 # Old mapping IDs may have changed after re-decomposition.
                 drafts.pop("map", None)
             if stage == "map":
-                plan = await request(map_schema, {**context, "decomposition": decomposition}, validator_schema=PLAN_SCHEMA)
-                record, audit = materialize(sample, decomposition, plan)
+                map_input = {**context, "decomposition": decomposition}
+                plan = await request(map_schema, map_input, validator_schema=PLAN_V2)
+                record, audit = materialize(sample, decomposition, plan, version=RUBRIC_PROTOCOL)
+                pending_proposals = None
+                if audit["added_issues"]:
+                    pending_proposals = {"attempt": attempt + 1, "proposals": audit["added_issues"],
+                                         "audit_status": "unverified"}
+                    proposal_attempts.append(pending_proposals)
+                stage, repair = ("inventory" if inventory is None else "audit"), None
+            if stage == "inventory":
+                inventory = await request(INVENTORY_SCHEMA, common)
+                validate_inventory(inventory, source, taxonomy)
                 stage, repair = "audit", None
             # Audit the source IDs and issue review reasons actually used in the public rubric.
             audit_plan = {**plan, "issues": [
@@ -95,13 +107,24 @@ async def build_sample(config, sample, client) -> dict:
                  "issue_review_reason": issue["issue_review_reason"]}
                 for outcome, issue in zip(plan["issues"], record["rubrics"]["issues"])
             ]}
-            decision = await request(audit_schema, {**context, "decomposition": decomposition, "plan": audit_plan})
+            decision = await request(AUDIT_V2, {**context, "decomposition": decomposition, "plan": audit_plan,
+                                               "independent_inventory": inventory})
+            coverage = audit_coverage(inventory, decision, decomposition, audit, source, taxonomy)
+            coverage_details = {"propositions": inventory["propositions"] + decision["additional_propositions"],
+                                "dispositions": decision["coverage"]}
+            if not decision["approved"]:
+                inventory = extend_inventory(inventory, decision["additional_propositions"])
+                if pending_proposals is not None:
+                    pending_proposals.update(audit_status="requires_repair", audit_problems=decision["problems"])
             validate_audit(decision)
+            if pending_proposals is not None:
+                pending_proposals["audit_status"] = "audit_accepted"
             return {**sample.identity(), "category": raw["category"], "dataset": record, "audit": audit,
-                    "decomposition": decomposition, "plan": plan, "semantic_audit": decision,
+                    "decomposition": decomposition, "plan": plan, "semantic_audit": decision, "inventory": inventory,
+                    "proposition_counts": coverage,
                     "model": config.rubric_model, "dataset_sha256": canonical_hash(record),
                     "metadata": {"completed_at": now(), "calls": calls, "validation_errors": errors,
-                                 "retry_stages": retries, "attempts": attempt + 1}}
+                                 "retry_stages": retries, "attempts": attempt + 1, "proposal_attempts": proposal_attempts}}
         except (ValueError, IncompleteResponse) as exc:
             target = exc.repair_stage if isinstance(exc, AuditRejected) else stage
             repair = str(exc)
@@ -111,7 +134,8 @@ async def build_sample(config, sample, client) -> dict:
             if attempt == config.rubric_json_retries:
                 raise APIError("Rubric validation exhausted: " + repair,
                                {"calls": calls, "validation_errors": errors, "retry_stages": retries,
-                                "failed_stage": stage, "attempts": attempt + 1}) from None
+                                "failed_stage": stage, "attempts": attempt + 1, "proposition_counts": coverage,
+                                "proposition_audit": coverage_details, "proposal_attempts": proposal_attempts}) from None
             retries.append({"failed_stage": stage, "retry_stage": target})
             if isinstance(exc, AuditRejected) and target == "decompose":
                 mapping_feedback = repair
@@ -121,7 +145,8 @@ async def build_sample(config, sample, client) -> dict:
             attempt += 1
         except APIError as exc:
             raise APIError(str(exc), {"calls": calls, "validation_errors": errors, "retry_stages": retries,
-                                      "failed_stage": stage, "attempts": attempt + 1}) from None
+                                      "failed_stage": stage, "attempts": attempt + 1, "proposition_counts": coverage,
+                                      "proposition_audit": coverage_details, "proposal_attempts": proposal_attempts}) from None
 
 
 def validate_audit(decision):
@@ -145,6 +170,8 @@ def read_seed_run(config, snapshot):
     with (seed / ".run.lock").open("rb") as lock:
         fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
         previous = strict_json((seed / "config.json").read_text(encoding="utf-8"))
+        if isinstance(previous, dict) and previous.get("rubric_protocol") != RUBRIC_PROTOCOL:
+            raise ValueError("Seed run predates independent proposition auditing. Start a fresh generation with RESUME=0.")
         keys = ("pipeline_kind", "artifact_version", "input_sha256", "limit", "rubric_model",
                 "rubric_base_url", "rubric_thinking", "rubric_response_format")
         if not isinstance(previous, dict) or any(previous.get(key) != snapshot[key] for key in keys):
@@ -159,21 +186,28 @@ def rubric_counts(samples, rows, errors):
     selected_errors = [row for row in errors if row["doc_name"] in names]
     issues = [issue for row in selected_rows for issue in row["dataset"]["rubrics"]["issues"]]
     criteria = [c for issue in issues for c in criteria_for(issue)]
-    added = sum(len(row["audit"]["added_issues"]) for row in selected_rows)
-    mapped = sum(len(row["audit"]["mapping"]) for row in selected_rows)
-    excluded = sum(len(row["audit"]["excluded_units"]) for row in selected_rows)
-    units = sum(len(row["audit"]["source_units"]) for row in selected_rows)
-    unmapped = units - mapped - excluded
+    additions = sum(len(row["audit"]["added_issues"]) for row in selected_rows)
+    propositions = {row["doc_name"]: row["metadata"].get("proposition_counts") for row in selected_errors}
+    propositions.update({row["doc_name"]: row["proposition_counts"] for row in selected_rows})
+    known = [counts for counts in propositions.values() if counts is not None]
+    totals = {status: sum(counts[status] for counts in known) for status in ("mapped", "excluded", "missing", "unverified")}
+    denominator = totals["mapped"] + totals["missing"] + totals["unverified"]
+    unassessed = len(samples) - len(known)
     failed = {row["doc_name"] for row in selected_errors} - {row["doc_name"] for row in selected_rows}
     return {"selected": len(samples), "completed": len(selected_rows), "failed": len(failed),
             "pending": len(samples) - len(selected_rows) - len(failed),
-            "original_issues": sum(len(sample.issues) for sample in samples), "added_issues": added,
+            "original_issues": sum(len(sample.issues) for sample in samples), "added_issues": additions,
             "samples_with_added_issues": sum(bool(row["audit"]["added_issues"]) for row in selected_rows),
-            "atomic_units": units, "mapped_units": mapped, "excluded_units": excluded, "unmapped_units": unmapped,
-            "rubric_coverage": mapped / (mapped + unmapped) if mapped + unmapped else None,
+            "atomic_units": sum(len(row["audit"]["source_units"]) for row in selected_rows),
+            "atomic_propositions": sum(totals.values()), **{f"{status}_propositions": value for status, value in totals.items()},
+            "unassessed_samples": unassessed, "unaudited_or_rejected_samples": len(samples) - len(selected_rows),
+            "rubric_coverage": (totals["mapped"] / denominator if denominator and len(selected_rows) == len(samples)
+                                and not unassessed and not totals["unverified"] else None),
             "criteria": len(criteria), "criteria_needing_review": sum(c["needs_review"] for c in criteria),
             "issues_needing_review": sum(i["issue_review_reason"] is not None or i["outcome_review_reason"] is not None or
                                         any(c["needs_review"] for c in criteria_for(i)) for i in issues),
+            "issues_excluded_from_application_score": sum(issue_blocked(i) or not any(c["scorable"] for c in criteria_for(i))
+                                                          for i in issues),
             "retry_attempts": sum(max(0, row["metadata"].get("attempts", 1) - 1) for row in selected_rows + selected_errors),
             "retried_samples": len({row["doc_name"] for row in selected_rows + selected_errors
                                     if row["metadata"].get("validation_errors")}),
@@ -194,22 +228,28 @@ class RubricPipeline(Pipeline):
         by_category = {}
         for sample in dataset.samples:
             by_category.setdefault(canonical_category(sample.raw["category"]), []).append(sample)
-        coverage = {"scope": "semantically_approved_samples", "assessed_samples": len(rows),
-                    "unassessed_samples": len(dataset.samples) - len(rows), "by_category": {
+        coverage = {"scope": "independent_expected_answer_propositions",
+                    "assessed_samples": len(dataset.samples) - counts["unassessed_samples"], "by_category": {
                         cat: rubric_counts(samples, rows, self.errors) for cat, samples in by_category.items()}}
         def event_rows(key):
             for row in rows:
                 for item in row["audit"][key]:
                     yield {"doc_name": row["doc_name"], "category": row["category"], **item}
 
+        def added_issues():
+            for item in event_rows("added_issues"):
+                yield {**item, "status": "audit_accepted"}
+
         def reviews():
+            for item in added_issues():
+                yield {**item, "review_status": "added_issue"}
             for row in rows:
                 for issue in row["dataset"]["rubrics"]["issues"]:
                     reasons = [issue[k] for k in ["issue_review_reason", "outcome_review_reason"] if issue[k]]
                     criteria = [c for c in criteria_for(issue) if c["needs_review"]]
                     if reasons or criteria:
                         yield {"doc_name": row["doc_name"], "category": row["category"], "issue_index": issue["issue_index"],
-                               "issue_text": issue["issue_text"], "reasons": reasons,
+                               "issue_text": issue["issue_text"], "reasons": reasons, "review_status": "needs_review",
                                "excluded_from_application_score": issue_blocked(issue) or not any(c["scorable"] for c in criteria_for(issue)),
                                "criteria": criteria}
             failed_docs = set()
@@ -220,11 +260,15 @@ class RubricPipeline(Pipeline):
                     yield {**error, "category": next(s.raw["category"] for s in dataset.samples if s.doc_name == doc),
                            "review_status": "rubric_generation_failed"}
 
-        atomic_jsonl(store.path / "added_issues.jsonl", event_rows("added_issues"))
+        atomic_jsonl(store.path / "added_issues.jsonl", added_issues())
         atomic_jsonl(store.path / "excluded_units.jsonl", event_rows("excluded_units"))
         atomic_jsonl(store.path / "rubric_review.jsonl", reviews())
         atomic_jsonl(store.path / "source_units.jsonl",
-                     ({"doc_name": row["doc_name"], "category": row["category"], **row["audit"]} for row in rows))
+                     ({"doc_name": row["doc_name"], "category": row["category"], **row["audit"],
+                       "independent_inventory": row["inventory"],
+                       "additional_propositions": row["semantic_audit"]["additional_propositions"],
+                       "coverage": row["semantic_audit"]["coverage"]} for row in rows))
+        atomic_jsonl(store.path / "rule_application_draft.jsonl", (row["dataset"] for row in rows))
         atomic_json(store.path / "rubric_coverage_report.json", {**coverage, **counts})
         missing = [sample.doc_name for sample in dataset.samples if sample.doc_name not in self.completed]
         summary = {"run_id": self.config.run_id, "status": status, "updated_at": now(),
@@ -279,7 +323,10 @@ class RubricPipeline(Pipeline):
                        "input_sha256": dataset.sha256}
             self.write_summary(store, summary)
             return summary
+        if not config.resume and len(dataset.samples) == dataset.input_count and any(path.exists() for path in targets):
+            raise ValueError("Verified output already exists; choose new final output paths for a fresh run")
         snapshot = {**config.snapshot(), "pipeline_kind": "rubric_generation", "artifact_version": 1,
+                    "rubric_protocol": RUBRIC_PROTOCOL,
                     "input_sha256": dataset.sha256, "implementation_sha256": implementation_hash(),
                     "rubric_thinking": resolve_thinking(config.rubric_thinking_mode)}
         seed_rows = []
@@ -301,10 +348,15 @@ class RubricPipeline(Pipeline):
             if sample is None or any(row.get(k) != v for k, v in sample.identity().items()):
                 raise ValueError("Rubric journal identity mismatch")
         for doc, row in self.completed.items():
-            expected, audit = materialize(samples[doc], row["decomposition"], row["plan"])
+            sample = samples[doc]
+            expected, audit = materialize(sample, row["decomposition"], row["plan"], version=RUBRIC_PROTOCOL)
             validate_audit(row["semantic_audit"])
+            coverage = audit_coverage(row["inventory"], row["semantic_audit"], row["decomposition"], audit,
+                                      source_segments(sample.raw["expected_answer"], "S"),
+                                      TAXONOMY[canonical_category(row["category"])])
             if row["dataset"] != expected or row["audit"] != audit or row["model"] != config.rubric_model or (
-                    row["dataset_sha256"] != canonical_hash(expected) or row["category"] != expected["category"]):
+                    row["dataset_sha256"] != canonical_hash(expected) or row["category"] != expected["category"]
+                    or row["proposition_counts"] != coverage):
                 raise ValueError(f"Stored rubric integrity check failed: {doc}")
         for row in imported:
             store.append("rubric_records.jsonl", row)
@@ -336,15 +388,14 @@ class RubricPipeline(Pipeline):
                 summary, _ = self.report(store, dataset, "completed_with_errors", skipped)
                 return summary
             if len(dataset.samples) != dataset.input_count:
-                summary, rows = self.report(store, dataset, "subset_completed", skipped)
-                atomic_jsonl(store.path / "rule_application_subset.jsonl", (row["dataset"] for row in rows))
-                atomic_jsonl(store.path / "issue_spotting_subset.jsonl", (spotting_row(row) for row in rows))
+                summary, _ = self.report(store, dataset, "subset_completed", skipped)
                 return summary
             if file_hash(config.input_jsonl) != dataset.sha256:
                 raise ValueError("Raw input changed during rubric generation")
             summary, rows = self.report(store, dataset, "ready_to_publish", skipped)
-            publish(targets, rows, snapshot, config.run_id)
-            summary.update(status="completed_with_review" if summary["counts"]["issues_needing_review"] else "completed",
+            publish(targets, verified_rows(rows), snapshot, config.run_id)
+            has_review_notes = summary["counts"]["issues_needing_review"] or summary["counts"]["added_issues"]
+            summary.update(status="completed_with_review" if has_review_notes else "completed",
                            published=True, outputs=[str(path) for path in targets])
             self.write_summary(store, summary)
             return summary
@@ -377,6 +428,7 @@ def publish(targets: list[Path], rows, snapshot, run_id):
         atomic_jsonl(staged[0], (row["dataset"] for row in rows))
         atomic_jsonl(staged[1], (spotting_row(row) for row in rows))
         manifest = {"version": 1, "kind": "rule_application_rubrics", "complete": True,
+                    "rubric_protocol": RUBRIC_PROTOCOL, "verification": "semantic_audit",
                     "run_id": run_id, "sample_count": len(rows), "raw_input": snapshot["input_jsonl"],
                     "raw_sha256": snapshot["input_sha256"], "implementation_sha256": snapshot["implementation_sha256"],
                     "rubric_model": snapshot["rubric_model"], "rubric_base_url": snapshot["rubric_base_url"],

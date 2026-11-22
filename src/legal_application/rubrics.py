@@ -7,7 +7,7 @@ from importlib.resources import files
 
 from jsonschema import Draft202012Validator
 
-from .data import Sample, parse_sample, rule_inputs, text_field
+from .data import Sample, canonical_hash, parse_sample, rule_inputs, text_field
 from .rubric_taxonomy import TAXONOMY, canonical_category
 
 
@@ -19,6 +19,26 @@ DECOMPOSITION_SCHEMA = load_schema("rubric_decomposition")
 PLAN_SCHEMA = load_schema("rubric_plan")
 AUDIT_SCHEMA = load_schema("rubric_audit")
 DATASET_SCHEMA = load_schema("rule_application_dataset")
+RUBRIC_PROTOCOL = 2
+
+
+def strict_wire_schema(schema: dict) -> dict:
+    """Require current fields on the wire while retaining historical rubric readers."""
+    result = {}
+    for key, value in schema.items():
+        if isinstance(value, dict):
+            result[key] = {n: strict_wire_schema(field) for n, field in value.items()} if key == "properties" else strict_wire_schema(value)
+        elif isinstance(value, list):
+            result[key] = [strict_wire_schema(item) if isinstance(item, dict) else item for item in value]
+        else:
+            result[key] = value
+    if "properties" in result:
+        result["required"] = list(result["properties"])
+    return result
+
+
+DECOMPOSITION_V2 = strict_wire_schema(DECOMPOSITION_SCHEMA)
+PLAN_V2 = strict_wire_schema(PLAN_SCHEMA)
 
 
 def require_schema(schema: dict, value, context: str) -> None:
@@ -70,8 +90,47 @@ def raw_rubric_sample(raw: dict, index: int) -> Sample:
     return Sample(index, projected, [])
 
 
-def validate_decomposition(value: dict, sources: dict[str, str]) -> dict[str, dict]:
-    require_schema(DECOMPOSITION_SCHEMA, value, "decomposition")
+def unit_spans(unit: dict, sources: dict[str, str]) -> list[tuple[str, int, int]]:
+    spans = []
+    for evidence in unit["evidence"]:
+        quote = text_field(evidence["quote"], "evidence.quote").strip()
+        sid = evidence["source_id"]
+        source = sources.get(sid)
+        if source is None:
+            raise ValueError(f"{unit['unit_id']}: unknown evidence source ID {evidence['source_id']!r}")
+        start = source.find(quote)
+        if start < 0:
+            # Restore exact source spacing when the service flattened a line break.
+            match = re.search(r"\s+".join(re.escape(word) for word in quote.split()), source)
+            if match is None:
+                raise ValueError(f"{unit['unit_id']}: evidence must quote {evidence['source_id']} verbatim")
+            start, end = match.span()
+        else:
+            end = start + len(quote)
+        spans.append((sid, start, end))
+    return list(dict.fromkeys(spans))
+
+
+def unit_quotes(unit: dict, sources: dict[str, str]) -> list[str]:
+    return list(dict.fromkeys(sources[sid][start:end] for sid, start, end in unit_spans(unit, sources)))
+
+
+def validate_unit(unit: dict, sources: dict[str, str], taxonomy: dict) -> list[str]:
+    text_field(unit["reasoning"], "unit reasoning")
+    if not re.fullmatch(r"[UP][1-9][0-9]*", unit["unit_id"]):
+        raise ValueError("Use a positive numbered unit or proposition ID")
+    if unit["group_id"] == "other":
+        text_field(unit["group_rationale"], "other group rationale")
+    elif unit["group_id"] not in taxonomy or unit["group_rationale"] is not None:
+        raise ValueError(f"{unit['unit_id']}: invalid decomposition group or group_rationale")
+    if {e["source_id"] for e in unit["evidence"]} != set(unit["source_ids"]):
+        raise ValueError(f"{unit['unit_id']}: cite verbatim evidence in each source_id")
+    return unit_quotes(unit, sources)
+
+
+def validate_decomposition(value: dict, sources: dict[str, str], *, taxonomy: dict | None = None,
+                           prefix: str = "U") -> dict[str, dict]:
+    require_schema(DECOMPOSITION_V2 if taxonomy is not None else DECOMPOSITION_SCHEMA, value, "decomposition")
     units = value["units"]
     unique([row["unit_id"] for row in units], "unit IDs")
     unique([normalized(row["reasoning"]) for row in units], "atomic reasoning")
@@ -80,6 +139,10 @@ def validate_decomposition(value: dict, sources: dict[str, str]) -> dict[str, di
         text_field(row["unit_id"], "unit_id")
         text_field(row["reasoning"], "unit reasoning")
         unique(row["source_ids"], f"source IDs for {row['unit_id']}")
+        if taxonomy is not None:
+            if not row["unit_id"].startswith(prefix):
+                raise ValueError(f"Use {prefix} IDs for this stage")
+            validate_unit(row, sources, taxonomy)
         mapped.update(row["source_ids"])
     excluded = [row["source_id"] for row in value["non_reasoning"]]
     unique(excluded, "non-reasoning source IDs")
@@ -90,14 +153,17 @@ def validate_decomposition(value: dict, sources: dict[str, str]) -> dict[str, di
     return {row["unit_id"]: row for row in units}
 
 
-def materialize(sample: Sample, decomposition: dict, plan: dict) -> tuple[dict, dict]:
+def materialize(sample: Sample, decomposition: dict, plan: dict, *, version: int = 1) -> tuple[dict, dict]:
     """Bind source IDs, validate accounting and build the fixed public rubric."""
     raw = sample.raw
     source = source_segments(raw["expected_answer"], "S")
     facts = source_segments(raw["input"]["facts_clean"], "F")
     groups = TAXONOMY[canonical_category(raw["category"])]
-    units = validate_decomposition(decomposition, source)
-    require_schema(PLAN_SCHEMA, plan, "rubric plan")
+    current = version == RUBRIC_PROTOCOL
+    units = validate_decomposition(decomposition, source, taxonomy=groups if current else None)
+    require_schema(PLAN_V2 if current else PLAN_SCHEMA, plan, "rubric plan")
+    quotes = {uid: unit_quotes(unit, source) if current else [source[sid] for sid in unit["source_ids"]]
+              for uid, unit in units.items()}
     issues = sample.issues + [row["issue_text"] for row in plan["added_issues"]]
     assignments = plan["assignments"]
     exclusions = plan["excluded_units"]
@@ -124,16 +190,26 @@ def materialize(sample: Sample, decomposition: dict, plan: dict) -> tuple[dict, 
             title = groups[group]
         else:
             raise ValueError(f"Unknown or inconsistent group {group!r} for {raw['category']}")
+        if current:
+            adjustment = row["group_adjustment_reason"]
+            if group != unit["group_id"]:
+                text_field(adjustment, f"{row['unit_id']}: group_adjustment_reason")
+            elif adjustment is not None:
+                raise ValueError(f"{row['unit_id']}: group_adjustment_reason must be null when the group is unchanged")
         group_key = (group, title)
         bucket = by_issue[i].setdefault(group_key, [])
         mapped_ids[i].add(row["unit_id"])
-        bucket.append({
+        criterion = {
             "criterion_id": "pending", "unit_id": unit["unit_id"], "criterion": row["criterion"],
-            "reference_reasoning": unit["reasoning"], "source_evidence": excerpts(unit["source_ids"], source, "source IDs"),
+            "reference_reasoning": unit["reasoning"], "source_evidence": quotes[unit["unit_id"]],
             "relevant_facts": excerpts(row["relevant_fact_ids"], facts, "facts_clean IDs"),
             "rule_refs": row["rule_indices"], "scorable": not row["missing_information"], "needs_review": bool(row["missing_information"]),
             "review_reason": row["review_reason"], "missing_information": row["missing_information"], "decisive": row["decisive"],
-        })
+        }
+        if current:
+            criterion.update(reasoning_type=unit["reasoning_type"], legal_condition=row["legal_condition"],
+                             application_link=row["application_link"])
+        bucket.append(criterion)
 
     added = []
     for i, row in enumerate(plan["added_issues"], len(sample.issues) + 1):
@@ -141,9 +217,15 @@ def materialize(sample: Sample, decomposition: dict, plan: dict) -> tuple[dict, 
             raise ValueError(f"Added issue {i} must be backed by exactly its assigned units")
         unique(row["unit_ids"], "added issue unit IDs")
         text_field(row["reason"], "added issue reason")
-        added.append({"issue_index": i, "original_issue_count": len(sample.issues), "new_issue": row["issue_text"],
-                      "reason": row["reason"], "source_evidence": list(dict.fromkeys(
-                          source[sid] for uid in row["unit_ids"] for sid in units[uid]["source_ids"]))})
+        proposal = {"issue_index": i, "original_issue_count": len(sample.issues), "new_issue": row["issue_text"],
+                    "reason": row["reason"], "source_evidence": list(dict.fromkeys(
+                        quote for uid in row["unit_ids"] for quote in quotes[uid]))}
+        if current:
+            proposal["why_existing_issues_do_not_cover"] = text_field(
+                row["why_existing_issues_do_not_cover"], "why_existing_issues_do_not_cover")
+            proposal["proposal_id"] = canonical_hash({"sample_sha256": sample.fingerprint, **proposal})
+            proposal["status"] = "proposed_added_issue"
+        added.append(proposal)
 
     rubric_issues = []
     if [row["issue_index"] for row in plan["issues"]] != list(by_issue):
@@ -175,16 +257,17 @@ def materialize(sample: Sample, decomposition: dict, plan: dict) -> tuple[dict, 
             "outcome_review_reason": outcome["outcome_review_reason"], "issue_review_reason": review_reason,
         })
     dataset = {"input": {**raw["input"], "issues": issues}, "expected_answer": raw["expected_answer"],
-               "doc_name": sample.doc_name, "category": raw["category"], "rubrics": {"version": 1, "issues": rubric_issues}}
+               "doc_name": sample.doc_name, "category": raw["category"], "rubrics": {"version": version, "issues": rubric_issues}}
+    if current:
+        dataset["rubrics"]["status"] = "draft"
     validate_rubric_record(dataset)
     excluded = []
     for row in exclusions:
         text_field(row["exclusion_reason"], "exclusion_reason")
-        excluded.append({**row, "source_evidence": excerpts(units[row["unit_id"]]["source_ids"], source, "excluded source IDs")})
+        excluded.append({**row, "source_evidence": quotes[row["unit_id"]]})
     audit = {"added_issues": added, "excluded_units": excluded,
              "non_reasoning": [{**row, "source_evidence": source[row["source_id"]]} for row in decomposition["non_reasoning"]],
-             "source_units": [{**unit, "source_evidence": excerpts(unit["source_ids"], source, "unit source IDs")}
-                              for unit in units.values()],
+             "source_units": [{**unit, "source_evidence": quotes[uid]} for uid, unit in units.items()],
              "mapping": [{"unit_id": c["unit_id"], "issue_index": issue["issue_index"], "criterion_id": c["criterion_id"]}
                          for issue in rubric_issues for c in criteria_for(issue)]}
     return dataset, audit
@@ -224,6 +307,9 @@ def validate_rubric_record(row: dict) -> None:
             if key != "citation_str" or value is not None:
                 text_field(value, f"rule.{key}")
     issues = row["rubrics"]["issues"]
+    current = row["rubrics"]["version"] == RUBRIC_PROTOCOL
+    if current and row["rubrics"].get("status") not in {"draft", "verified"}:
+        raise ValueError("Version 2 rubrics require draft or verified status")
     if [issue["issue_text"] for issue in issues] != payload["issues"]:
         raise ValueError("Rubric issues must match input issues exactly and in order")
     all_criteria = []
@@ -252,6 +338,17 @@ def validate_rubric_record(row: dict) -> None:
                 raise ValueError("Rule reference is outside the input rules")
             missing = criterion["missing_information"]
             review = criterion["needs_review"]
+            if current:
+                if not {"reasoning_type", "legal_condition", "application_link"} <= criterion.keys():
+                    raise ValueError("Criterion lacks reasoning_type or grounding fields")
+                for field in ["legal_condition", "application_link"]:
+                    if criterion[field] is not None:
+                        text_field(criterion[field], field)
+                if criterion["reasoning_type"] == "fact_to_rule_application":
+                    if not criterion["application_link"] or not criterion["legal_condition"]:
+                        raise ValueError(f"{criterion['criterion_id']}: explain the legal condition and how it applies")
+                    if not review and (not criterion["relevant_facts"] or not refs):
+                        raise ValueError(f"{criterion['criterion_id']}: Fact-to-Rule needs input facts and rules or explicit review")
             if review == criterion["scorable"] or review != bool(missing) or review != bool(criterion["review_reason"]):
                 raise ValueError("Criterion review requires missing_information, review_reason and scorable=false")
             for explanation in missing + ([criterion["review_reason"]] if review else []):
@@ -276,4 +373,6 @@ def validate_rubric_record(row: dict) -> None:
 
 def rubric_sample(raw: dict, index: int) -> Sample:
     validate_rubric_record(raw)
+    if raw["rubrics"].get("status") == "draft":
+        raise ValueError("Draft rubric dataset must be verified before evaluation")
     return Sample(index, raw, [])

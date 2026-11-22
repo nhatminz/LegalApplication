@@ -14,7 +14,7 @@ from .data import DatasetError, Sample, canonical_hash, read_dataset, strict_jso
 from .input_cleanup import clean_input
 from .prompts import generator_messages, judge_messages, rubric_generator_messages, rubric_judge_messages
 from .scoring import LABEL_SCHEMA, RUBRIC_JUDGE_SCHEMA, LabelError, score_labels, score_rubric_labels
-from .rubrics import rubric_sample
+from .rubrics import RUBRIC_PROTOCOL, rubric_sample
 from .rubric_taxonomy import canonical_category
 from .storage import RunStore, file_hash, implementation_hash, now, read_jsonl
 from .filter_full import verify_full_manifest
@@ -302,14 +302,27 @@ class Pipeline:
                      settings["effort_budget"], settings["parameters"])
         try:
             if rubric:
-                dataset = read_dataset(config.input_jsonl, config.limit, parser=rubric_sample)
+                manifest_present = rubric_manifest.is_file()
+                current_protocol = False
+
+                def parse_verified(row, index):
+                    nonlocal current_protocol
+                    sample = rubric_sample(row, index)
+                    if row["rubrics"]["version"] == RUBRIC_PROTOCOL:
+                        current_protocol = True
+                        if not manifest_present:
+                            raise ValueError("Verified version 2 rubric dataset requires its publication manifest")
+                    return sample
+
+                dataset = read_dataset(config.input_jsonl, config.limit, parser=parse_verified)
                 if config.expected_count is not None and dataset.input_count != config.expected_count:
                     raise ValueError(f"EXPECTED_COUNT={config.expected_count}, found {dataset.input_count} dataset rows")
                 snapshot["input_sha256"] = dataset.sha256
-                if rubric_manifest.is_file():
+                if manifest_present:
                     manifest = strict_json(rubric_manifest.read_text(encoding="utf-8"))
                     if (not isinstance(manifest, dict) or manifest.get("kind") != "rule_application_rubrics"
                             or manifest.get("complete") is not True or manifest.get("sample_count") != dataset.input_count
+                            or (current_protocol and manifest.get("rubric_protocol") != RUBRIC_PROTOCOL)
                             or not isinstance(manifest.get("application"), dict)
                             or manifest["application"].get("sha256") != dataset.sha256):
                         raise ValueError("Rubric dataset does not match its publication manifest")

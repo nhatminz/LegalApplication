@@ -1,0 +1,5 @@
+Đây là lượt đọc độc lập để lập danh mục kiểm chứng độ bao phủ. Chỉ dùng Expected Answer được phân đoạn và metadata loại án/cấp xét xử. Không có decomposition/mapping của generator. Đọc từng đoạn và kiểm tra xuyên các đoạn khi một lập luận nối tiếp nhau.
+
+Đếm từng mệnh đề pháp lý nguyên tử, kể cả nhiều mệnh đề nằm cùng một câu hoặc đoạn: xác định tình tiết, xác định điều kiện pháp lý, áp dụng điều kiện vào tình tiết cụ thể, xác định hậu quả pháp lý. Tách khi hai ý có thể được kiểm tra độc lập, ví dụ một đoạn vừa xác định hành vi vi phạm vừa giải thích cơ sở xác định khoản bồi thường. Không tạo nhiều mệnh đề chỉ vì một ý được nhắc nhiều lần. Giữ riêng mệnh đề án phí/thủ tục để lượt audit sau quyết định phạm vi.
+
+Với mỗi proposition dùng ID P1, P2... trong unit_id. Ghi reasoning cụ thể, reasoning_type, group_id theo taxonomy, group_rationale nếu dùng other, source_ids và evidence. Mỗi evidence chọn một đoạn trích NGẮN, NGUYÊN VĂN và liên tục trong đúng source_id, đủ nhận diện riêng mệnh đề. Một mệnh đề có thể cần nhiều trích đoạn. Nếu không có nhận định trong một đoạn, ghi vào non_reasoning và nêu lý do. Dùng đủ mọi đoạn nguồn. Trả JSON theo schema.
