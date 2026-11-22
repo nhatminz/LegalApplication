@@ -15,6 +15,7 @@ from resume_statistic import DEFAULT_PROJECT_ROOT, snapshot_environment
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_id", help="Existing run ID in OUTPUT_DIR")
+    parser.add_argument("--retry-into", metavar="NEW_RUN_ID", help="Import completed rubrics into a new run using updated code")
     args = parser.parse_args()
     try:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.run_id):
@@ -35,6 +36,10 @@ def main() -> int:
         if build:
             environment["RAW_INPUT_JSONL"] = snapshot["input_jsonl"]
         environment["RESUME"] = "1"
+        if args.retry_into:
+            if not build or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.retry_into) or args.retry_into == args.run_id:
+                raise ValueError("--retry-into requires a different run ID and a rubric generation source run")
+            environment.update(RUN_ID=args.retry_into, RESUME="0", RUBRIC_SEED_RUN=str(output / args.run_id))
         os.chdir(root)
         os.execvpe(sys.executable, [sys.executable, "-m", "legal_application"], environment)
     except (ValueError, OSError) as exc:

@@ -6,6 +6,9 @@
     "approved": {
       "type": "boolean"
     },
+    "repair_stage": {
+      "enum": [null, "decompose", "map"]
+    },
     "problems": {
       "type": "array",
       "items": {

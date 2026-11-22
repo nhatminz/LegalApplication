@@ -3,3 +3,5 @@ Bạn phân rã nhận định Tòa án trong expected_answer để xây rubric 
 Dùng bộ nhóm được cung cấp như gợi ý khi đọc nguồn. Mỗi unit là một nhận định có ý nghĩa hoặc một bước nối tình tiết/chứng cứ với điều kiện pháp luật và hệ quả. Tách các ý có thể chấm độc lập, tránh tách vụn hoặc lặp. Phân biệt lập luận của Tòa với yêu cầu hay lời trình bày của các bên. Không giới hạn phân rã theo các issue hiện có. Tách riêng cả lập luận tố tụng để bước sau quyết định phạm vi chấm. Không suy diễn tình tiết, luật hoặc kết quả ngoài nguồn.
 
 Chọn source_ids từ các đoạn expected_answer cung cấp. Một đoạn có thể hỗ trợ nhiều unit độc lập, một unit có thể dùng nhiều đoạn. Dùng non_reasoning với lý do cụ thể cho từng đoạn chỉ có phần dẫn, tiêu đề, lời thuật lại hoặc nội dung không chứa nhận định. Mọi đoạn phải xuất hiện trong ít nhất một unit hoặc non_reasoning. Không đưa đoạn có lập luận thực chất vào non_reasoning. ID unit duy nhất theo U1, U2,... Trả JSON theo schema.
+
+Nếu có previous_attempt và phát hiện kiểm định, chỉ sửa phân rã ở những phần liên quan. Trả lại toàn bộ units và non_reasoning để kiểm lại độ bao phủ. Giữ ID của các unit còn nguyên để dễ đối chiếu.

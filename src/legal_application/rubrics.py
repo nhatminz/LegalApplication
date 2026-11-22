@@ -159,11 +159,20 @@ def materialize(sample: Sample, decomposition: dict, plan: dict) -> tuple[dict, 
                 other_number += 1
                 group = f"other_{other_number}"
             rubric_groups.append({"group_id": group, "group_name": title, "criteria": criteria})
+        review_reason = outcome["issue_review_reason"]
+        if review_reason is None:
+            decisive_reasons = [c["review_reason"] for group in rubric_groups for c in group["criteria"]
+                                if c["needs_review"] and c["decisive"] and c["review_reason"]]
+            if decisive_reasons:
+                review_reason = " | ".join(dict.fromkeys(decisive_reasons))
+            elif not rubric_groups:
+                review_reason = "Không có lập luận từ nguồn được ánh xạ vào issue này."
         rubric_issues.append({
             "issue_index": i, "issue_text": issues[i-1], "groups": rubric_groups,
             "reference_verdict": outcome["reference_verdict"],
-            "verdict_evidence": excerpts(outcome["verdict_source_ids"], source, "verdict source IDs"),
-            "outcome_review_reason": outcome["outcome_review_reason"], "issue_review_reason": outcome["issue_review_reason"],
+            "verdict_evidence": excerpts(resolve_verdict_ids(outcome["verdict_source_ids"], units, source),
+                                         source, "verdict source IDs"),
+            "outcome_review_reason": outcome["outcome_review_reason"], "issue_review_reason": review_reason,
         })
     dataset = {"input": {**raw["input"], "issues": issues}, "expected_answer": raw["expected_answer"],
                "doc_name": sample.doc_name, "category": raw["category"], "rubrics": {"version": 1, "issues": rubric_issues}}
@@ -186,7 +195,21 @@ def criteria_for(issue: dict) -> list[dict]:
 
 
 def issue_blocked(issue: dict) -> bool:
-    return any(c["needs_review"] and c["decisive"] for c in criteria_for(issue))
+    return issue["issue_review_reason"] is not None or any(c["needs_review"] and c["decisive"] for c in criteria_for(issue))
+
+
+def resolve_verdict_ids(ids: list[str], units: dict[str, dict], source: dict[str, str]) -> list[str]:
+    """Resolve a known unit to the exact source spans already validated for that unit."""
+    unique(ids, "verdict source IDs")
+    resolved = []
+    for identifier in ids:
+        if identifier in source:
+            resolved.append(identifier)
+        elif identifier in units:
+            resolved.extend(units[identifier]["source_ids"])
+        else:
+            raise ValueError(f"Unknown verdict source ID {identifier!r}; use a key from expected_answer_segments")
+    return list(dict.fromkeys(resolved))
 
 
 def validate_rubric_record(row: dict) -> None:
@@ -236,8 +259,6 @@ def validate_rubric_record(row: dict) -> None:
         reason = issue["issue_review_reason"]
         if not criteria or issue_blocked(issue):
             text_field(reason, "issue_review_reason")
-        elif reason is not None:
-            raise ValueError("Unexpected issue_review_reason for an issue with grounded criteria")
         verdict = issue["reference_verdict"]
         if verdict is None:
             text_field(issue["outcome_review_reason"], "outcome_review_reason")

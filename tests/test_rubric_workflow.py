@@ -155,7 +155,8 @@ def test_build_retry_resume_paired_publish_and_evaluate(config_factory, tmp_path
         if stage == "audit":
             assert payload["plan"] == plan
         value = {"decompose": dec, "map": plan,
-                 "audit": {"approved": approved, "problems": [] if approved else ["Unit U2 excluded without adequate reasoning"]}}[stage]
+                 "audit": {"approved": approved, "problems": [] if approved else ["Unit U2 excluded without adequate reasoning"],
+                           "repair_stage": None if approved else "map"}}[stage]
         return httpx.Response(200, json=envelope(json.dumps(value, ensure_ascii=False)))
 
     first = run_build(config, rubric)
@@ -276,6 +277,108 @@ def test_decisively_blocked_issue_keeps_scores_of_other_valid_criteria():
     assert scores["issues"][0]["scored_criteria"] == 1
 
 
+def test_review_reason_kept_when_grounded_criteria_cover_only_part_of_issue():
+    sample, dec, plan = artifacts(raw_record())
+    plan["issues"][0]["issue_review_reason"] = "Nguồn giải quyết một phần và chưa đủ căn cứ cho toàn issue."
+    row, _ = materialize(sample, dec, plan)
+    labels = judge_result(row)
+    assert labels["issues_evaluation"][0]["criterion_scores"][0]["criterion_id"] == "I1_C1"
+    result = score_rubric_labels(labels, rubric_sample(row, 0), WORDS)
+    assert result["application_score"] is None and result["outcome_accuracy"] is None
+
+
+@pytest.mark.parametrize("repair_stage", ["map", "decompose"])
+def test_rubric_repair_uses_verified_source_ids_and_retries_only_required_stage(config_factory, tmp_path, repair_stage):
+    raw = raw_record("recovery")
+    raw["benchmark_seed"]["application"] = ANSWER + "\n" + "Nội dung khác để tạo đoạn nguồn. " * 30
+    _, dec, plan = artifacts(raw, missing=True)
+    plan["issues"][0].update(issue_review_reason=None, verdict_source_ids=["U1", "S1"])
+    config = config_factory([raw], mode="build-rubrics", expected_count=1, rubric_json_retries=2,
+                            final_application_jsonl=tmp_path / "application.jsonl",
+                            final_issue_spotting_jsonl=tmp_path / "spotting.jsonl")
+    calls = []
+
+    def rubric(request):
+        body = json.loads(request.content)
+        schema = body["response_format"]["json_schema"]["schema"]["properties"]
+        stage = "decompose" if "units" in schema else "map" if "assignments" in schema else "audit"
+        system = body["messages"][0]["content"]
+        payload = json.loads(body["messages"][1]["content"])
+        calls.append(stage)
+        if stage in {"map", "audit"}:
+            assert "Án phí, quyền kháng cáo" in system and "input cố định" in system
+        if stage == "decompose":
+            value = dec
+            if calls.count(stage) > 1:
+                assert payload["previous_attempt"] == dec and "Cần sửa U1" in system
+        elif stage == "map":
+            assert payload["decomposition"] == dec
+            assert schema["issues"]["items"]["properties"]["verdict_source_ids"]["items"]["enum"] == list(payload["expected_answer_segments"])
+            value = deepcopy(plan)
+            if calls.count(stage) == 1:
+                value["issues"][0]["verdict_source_ids"] = ["U404"]
+            if calls.count(stage) == 2:
+                assert payload["previous_attempt"]["issues"][0]["verdict_source_ids"] == ["U404"]
+            if calls.count(stage) == 3:
+                assert "Cần sửa U1" in system
+                assert ("previous_attempt" in payload) == (repair_stage == "map")
+        else:
+            outcome = payload["plan"]["issues"][0]
+            assert outcome["verdict_source_ids"] == list(payload["expected_answer_segments"])
+            assert outcome["issue_review_reason"] == plan["assignments"][0]["review_reason"]
+            approved = calls.count(stage) > 1
+            value = {"approved": approved, "problems": [] if approved else ["Cần sửa U1"],
+                     "repair_stage": None if approved else repair_stage}
+        return httpx.Response(200, json=envelope(json.dumps(value, ensure_ascii=False)))
+
+    assert run_build(config, rubric)["published"]
+    assert calls == ["decompose", "map", "map", "audit", *(["decompose"] if repair_stage == "decompose" else []), "map", "audit"]
+    saved = read_jsonl(config.run_dir / "rubric_records.jsonl")[0]
+    assert saved["metadata"]["retry_stages"] == [
+        {"failed_stage": "map", "retry_stage": "map"}, {"failed_stage": "audit", "retry_stage": repair_stage}]
+    assert saved["dataset"]["rubrics"]["issues"][0]["verdict_evidence"] == list(source_segments(raw["benchmark_seed"]["application"], "S").values())
+
+
+def test_retry_into_new_run_replays_completed_rubric_and_only_calls_failed_sample(config_factory, tmp_path):
+    rows = [raw_record("old-approved"), raw_record("old-failed", "Commercial")]
+    cfg = config_factory(rows, mode="build-rubrics", expected_count=2, rubric_json_retries=0, api_max_retries=0,
+                         final_application_jsonl=tmp_path / "application.jsonl",
+                         final_issue_spotting_jsonl=tmp_path / "spotting.jsonl")
+    seen = []
+    first_run = True
+
+    def judge(request):
+        body = json.loads(request.content)
+        payload = json.loads(body["messages"][1]["content"])
+        seen.append(payload["category"])
+        if first_run and payload["category"] == "Commercial":
+            return httpx.Response(503)
+        _, dec, plan = artifacts(next(row for row in rows if row["category"] == payload["category"]))
+        fields = body["response_format"]["json_schema"]["schema"]["properties"]
+        value = (dec if "units" in fields else plan if "assignments" in fields
+                 else {"approved": True, "problems": [], "repair_stage": None})
+        return httpx.Response(200, json=envelope(json.dumps(value, ensure_ascii=False)))
+
+    assert run_build(cfg, judge)["counts"]["completed"] == 1
+    source = cfg.run_dir / "rubric_records.jsonl"
+    saved = read_jsonl(source)[0]
+    saved["semantic_audit"].pop("repair_stage")  # Older approved audit records omit this field.
+    source.write_text(json.dumps(saved, ensure_ascii=False) + "\n", encoding="utf-8")
+    original = source.read_bytes()
+    old_snapshot_path = cfg.run_dir / "config.json"
+    snapshot = json.loads(old_snapshot_path.read_text())
+    snapshot["implementation_sha256"] = "prior-code"
+    old_snapshot_path.write_text(json.dumps(snapshot))
+    first_run = False
+    seen.clear()
+    recovery = replace(cfg, run_id="rubric-retry", rubric_seed_run=cfg.run_dir)
+    summary = run_build(recovery, judge)
+    assert seen == ["Commercial"] * 3
+    assert summary["published"] and summary["counts"]["skipped"] == 1
+    assert source.read_bytes() == original
+    assert read_jsonl(recovery.run_dir / "rubric_records.jsonl")[0] == read_jsonl(source)[0]
+
+
 def test_invalid_row_after_limit_fails_read_only(config_factory):
     sample, dec, plan = artifacts(raw_record())
     row, _ = materialize(sample, dec, plan)
@@ -311,7 +414,8 @@ def test_full_run_count_mismatch_stops_before_api_or_final_publication(config_fa
     assert summary["counts"]["input"] == 1
 
 
-def test_rubric_resume_helper_restores_raw_input_and_settings(config_factory, monkeypatch, tmp_path):
+@pytest.mark.parametrize("retry_into", [False, True])
+def test_rubric_resume_helper_restores_raw_input_and_settings(config_factory, monkeypatch, tmp_path, retry_into):
     cfg = config_factory([raw_record()], mode="build-rubrics", expected_count=1, rubric_concurrency=11,
                          final_application_jsonl=tmp_path / "application.jsonl",
                          final_issue_spotting_jsonl=tmp_path / "spotting.jsonl")
@@ -324,7 +428,8 @@ def test_rubric_resume_helper_restores_raw_input_and_settings(config_factory, mo
     monkeypatch.setenv("OUTPUT_DIR", str(cfg.output_dir))
     monkeypatch.setenv("RAW_INPUT_JSONL", "wrong.jsonl")
     monkeypatch.setenv("RUBRIC_CONCURRENCY", "99")
-    monkeypatch.setattr(sys, "argv", [str(scripts / "resume_rubric_run.py"), cfg.run_id])
+    args = ["--retry-into", "new-run"] if retry_into else []
+    monkeypatch.setattr(sys, "argv", [str(scripts / "resume_rubric_run.py"), cfg.run_id, *args])
     monkeypatch.setattr(resume_rubric_run.os, "chdir", lambda _: None)
     captured = {}
     monkeypatch.setattr(resume_rubric_run.os, "execvpe", lambda _, argv, env: captured.update(env))
@@ -332,6 +437,8 @@ def test_rubric_resume_helper_restores_raw_input_and_settings(config_factory, mo
     for key, value in captured.items():
         monkeypatch.setenv(key, value)
     restored = Config.from_env()
-    assert restored.resume and restored.mode == "build-rubrics"
+    assert restored.resume == (not retry_into) and restored.mode == "build-rubrics"
+    assert restored.rubric_seed_run == (cfg.run_dir if retry_into else None)
+    assert restored.run_id == ("new-run" if retry_into else cfg.run_id)
     assert restored.input_jsonl == cfg.input_jsonl
     assert restored.rubric_concurrency == 11 and restored.expected_count == 1

@@ -7,6 +7,7 @@ import json
 import logging
 from collections import Counter
 from contextlib import ExitStack
+from copy import deepcopy
 from pathlib import Path
 
 from tqdm import tqdm
@@ -17,19 +18,28 @@ from .pipeline import Pipeline, bounded_map, index_records
 from .prompts import prompt_text
 from .rubric_taxonomy import CIVIL_ANCHOR, PROCEDURAL_ANCHORS, TAXONOMY, canonical_category
 from .rubrics import (AUDIT_SCHEMA, DECOMPOSITION_SCHEMA, PLAN_SCHEMA, criteria_for, issue_blocked, materialize,
-                      raw_rubric_sample, require_schema, source_segments, validate_decomposition)
-from .storage import atomic_json, atomic_jsonl, file_hash, implementation_hash, now
+                      raw_rubric_sample, require_schema, resolve_verdict_ids, source_segments, validate_decomposition)
+from .storage import atomic_json, atomic_jsonl, file_hash, implementation_hash, now, read_jsonl
 from .thinking import resolve_thinking
 
 log = logging.getLogger(__name__)
 
 
 def stage_messages(stage, schema, payload, repair):
-    system = prompt_text(f"rubric_{stage}") + "\nJSON SCHEMA:\n" + json.dumps(schema, ensure_ascii=False)
+    system = prompt_text(f"rubric_{stage}")
+    if stage in {"map", "audit"}:
+        system += "\n" + prompt_text("rubric_scope")
     if repair:
         system += "\nKết quả trước bị từ chối. Đọc lại nguồn và sửa phát hiện sau: " + repair
+    system += "\nJSON SCHEMA:\n" + json.dumps(schema, ensure_ascii=False)
     return [{"role": "system", "content": system},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, allow_nan=False)}]
+
+
+class AuditRejected(ValueError):
+    def __init__(self, decision):
+        super().__init__("Semantic audit rejected: " + " | ".join(decision["problems"]))
+        self.repair_stage = decision["repair_stage"]
 
 
 async def build_sample(config, sample, client) -> dict:
@@ -40,10 +50,21 @@ async def build_sample(config, sample, client) -> dict:
               "analysis_reference": PROCEDURAL_ANCHORS.get(category, CIVIL_ANCHOR),
               "instance_level": raw.get("instance_level"), "code": raw.get("code")}
     context = {**common, **raw["input"], "facts_clean_segments": source_segments(raw["input"]["facts_clean"], "F")}
-    calls, errors = [], []
-    repair = None
 
-    async def request(stage, schema, payload):
+    # Constrain verdict IDs at generation time. The materializer can still resolve a
+    # known U ID safely when an endpoint returns a JSON object without enforcing this enum.
+    map_schema = deepcopy(PLAN_SCHEMA)
+    verdict_ids = map_schema["properties"]["issues"]["items"]["properties"]["verdict_source_ids"]
+    verdict_ids["items"]["enum"] = list(source)
+    audit_schema = {**AUDIT_SCHEMA, "required": [*AUDIT_SCHEMA["required"], "repair_stage"]}
+    calls, errors, retries, drafts = [], [], [], {}
+    stage, repair = "decompose", None
+    mapping_feedback = None
+    attempt = 0
+
+    async def request(schema, payload, *, validator_schema=None):
+        if repair and stage in drafts and stage != "audit":
+            payload = {**payload, "previous_attempt": drafts[stage]}
         try:
             response = await client.complete(stage_messages(stage, schema, payload, repair), doc_name=sample.doc_name, schema=schema)
         except APIError as exc:
@@ -51,34 +72,56 @@ async def build_sample(config, sample, client) -> dict:
             raise
         calls.append({"stage": stage, **response.metadata})
         value = strict_json(response.content)
-        require_schema(schema, value, stage)
+        drafts[stage] = value
+        require_schema(validator_schema or schema, value, stage)
         return value
 
-    for attempt in range(config.rubric_json_retries + 1):
+    while True:
         try:
-            decomposition = await request("decompose", DECOMPOSITION_SCHEMA, common)
-            validate_decomposition(decomposition, source)
-            plan = await request("map", PLAN_SCHEMA, {**context, "decomposition": decomposition})
-            record, audit = materialize(sample, decomposition, plan)
-            decision = await request("audit", AUDIT_SCHEMA, {**context, "decomposition": decomposition, "plan": plan})
+            if stage == "decompose":
+                decomposition = await request(DECOMPOSITION_SCHEMA, common)
+                units = validate_decomposition(decomposition, source)
+                stage, repair = "map", mapping_feedback
+                mapping_feedback = None
+                # Old mapping IDs may have changed after re-decomposition.
+                drafts.pop("map", None)
+            if stage == "map":
+                plan = await request(map_schema, {**context, "decomposition": decomposition}, validator_schema=PLAN_SCHEMA)
+                record, audit = materialize(sample, decomposition, plan)
+                stage, repair = "audit", None
+            # Audit the source IDs and issue review reasons actually used in the public rubric.
+            audit_plan = {**plan, "issues": [
+                {**outcome, "verdict_source_ids": resolve_verdict_ids(outcome["verdict_source_ids"], units, source),
+                 "issue_review_reason": issue["issue_review_reason"]}
+                for outcome, issue in zip(plan["issues"], record["rubrics"]["issues"])
+            ]}
+            decision = await request(audit_schema, {**context, "decomposition": decomposition, "plan": audit_plan})
             validate_audit(decision)
             return {**sample.identity(), "category": raw["category"], "dataset": record, "audit": audit,
                     "decomposition": decomposition, "plan": plan, "semantic_audit": decision,
                     "model": config.rubric_model, "dataset_sha256": canonical_hash(record),
                     "metadata": {"completed_at": now(), "calls": calls, "validation_errors": errors,
-                                 "attempts": attempt + 1}}
+                                 "retry_stages": retries, "attempts": attempt + 1}}
         except (ValueError, IncompleteResponse) as exc:
-            repair = str(exc)[:2500]
+            target = exc.repair_stage if isinstance(exc, AuditRejected) else stage
+            repair = str(exc)
             errors.append(repair)
-            log.warning("Rubric validation failed doc_name=%s attempt=%d error=%s", sample.doc_name, attempt + 1, repair)
+            log.warning("Rubric validation failed doc_name=%s stage=%s retry_stage=%s attempt=%d error=%s",
+                        sample.doc_name, stage, target, attempt + 1, repair)
             if attempt == config.rubric_json_retries:
                 raise APIError("Rubric validation exhausted: " + repair,
-                               {"calls": calls, "validation_errors": errors, "attempts": attempt + 1}) from None
+                               {"calls": calls, "validation_errors": errors, "retry_stages": retries,
+                                "failed_stage": stage, "attempts": attempt + 1}) from None
+            retries.append({"failed_stage": stage, "retry_stage": target})
+            if isinstance(exc, AuditRejected) and target == "decompose":
+                mapping_feedback = repair
+            stage = target
             if config.retry_backoff:
                 await asyncio.sleep(min(60, config.retry_backoff * 2 ** attempt))
+            attempt += 1
         except APIError as exc:
-            raise APIError(str(exc), {"calls": calls, "validation_errors": errors, "attempts": attempt + 1}) from None
-    raise AssertionError("unreachable")
+            raise APIError(str(exc), {"calls": calls, "validation_errors": errors, "retry_stages": retries,
+                                      "failed_stage": stage, "attempts": attempt + 1}) from None
 
 
 def validate_audit(decision):
@@ -87,8 +130,27 @@ def validate_audit(decision):
         text_field(problem, "audit problem")
     if decision["approved"] != (not decision["problems"]):
         raise ValueError("Semantic audit approval and problems are inconsistent")
+    if decision["approved"] and decision.get("repair_stage") is not None:
+        raise ValueError("Approved semantic audit must have repair_stage=null")
     if not decision["approved"]:
-        raise ValueError("Semantic audit rejected: " + " | ".join(decision["problems"]))
+        if decision.get("repair_stage") is None:
+            raise ValueError("Rejected semantic audit must specify repair_stage")
+        raise AuditRejected(decision)
+
+
+def read_seed_run(config, snapshot):
+    seed = config.rubric_seed_run
+    if seed.resolve() == config.run_dir.resolve():
+        raise ValueError("The seed run and the new run must be different")
+    with (seed / ".run.lock").open("rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        previous = strict_json((seed / "config.json").read_text(encoding="utf-8"))
+        keys = ("pipeline_kind", "artifact_version", "input_sha256", "limit", "rubric_model",
+                "rubric_base_url", "rubric_thinking", "rubric_response_format")
+        if not isinstance(previous, dict) or any(previous.get(key) != snapshot[key] for key in keys):
+            raise ValueError("Seed run must match the raw input checksum, selection and rubric model settings")
+        path = seed / "rubric_records.jsonl"
+        return read_jsonl(path), file_hash(path)
 
 
 def rubric_counts(samples, rows, errors):
@@ -220,9 +282,19 @@ class RubricPipeline(Pipeline):
         snapshot = {**config.snapshot(), "pipeline_kind": "rubric_generation", "artifact_version": 1,
                     "input_sha256": dataset.sha256, "implementation_sha256": implementation_hash(),
                     "rubric_thinking": resolve_thinking(config.rubric_thinking_mode)}
+        seed_rows = []
+        if config.rubric_seed_run is not None:
+            seed_rows, snapshot["rubric_seed_sha256"] = read_seed_run(config, snapshot)
         store.configure(snapshot, artifact_names=["rubric_records.jsonl", "errors.jsonl"])
         samples = {sample.doc_name: sample for sample in dataset.samples}
         self.completed = index_records(store.load("rubric_records.jsonl"), samples)
+        imported = []
+        for doc, row in index_records(seed_rows, samples).items():
+            if doc not in self.completed:
+                self.completed[doc] = row
+                imported.append(row)
+            elif self.completed[doc] != row:
+                raise ValueError(f"Seed rubric differs from the saved checkpoint: {doc}")
         self.errors = store.load("errors.jsonl")
         for row in self.errors + list(self.completed.values()):
             sample = samples.get(row.get("doc_name"))
@@ -234,6 +306,10 @@ class RubricPipeline(Pipeline):
             if row["dataset"] != expected or row["audit"] != audit or row["model"] != config.rubric_model or (
                     row["dataset_sha256"] != canonical_hash(expected) or row["category"] != expected["category"]):
                 raise ValueError(f"Stored rubric integrity check failed: {doc}")
+        for row in imported:
+            store.append("rubric_records.jsonl", row)
+        if imported:
+            log.info("Imported %d validated rubrics from %s", len(imported), config.rubric_seed_run)
         skipped = len(self.completed)
         pending = [sample for sample in dataset.samples if sample.doc_name not in self.completed]
         client = APIClient(config, "rubric", self.rubric_transport)
@@ -311,6 +387,9 @@ def publish(targets: list[Path], rows, snapshot, run_id):
                                  "projected_sample_sha256": row["sample_sha256"], "raw_input_line": row["input_line"],
                                  "dataset_sha256": row["dataset_sha256"], "issue_count": len(row["dataset"]["input"]["issues"])}
                                 for i, row in enumerate(rows, 1)]}
+        if snapshot.get("rubric_seed_run"):
+            manifest["seed_run"] = {"path": snapshot["rubric_seed_run"],
+                                    "rubric_records_sha256": snapshot["rubric_seed_sha256"]}
         atomic_json(staged[2], manifest)
         for path, temp in zip(targets, staged):
             if path.exists() and file_hash(path) != file_hash(temp):

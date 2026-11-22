@@ -78,6 +78,16 @@ bash scripts/resume_rubric_run.sh evaluate-qwen3-4b-rubric-v1
 
 `config.json` cố định code, input, endpoint, model, thinking, lịch batch, giới hạn và các cài đặt của run. Sau khi đổi code hoặc rubric, dùng run ID mới. Các run statistic trước refactor cần bản code tương ứng hoặc nhập lại kết quả hợp lệ qua `retry_statistic.sh`.
 
+Với run sinh rubric đã có mẫu thành công và cần chạy lại bằng code mới, dùng dir name của run cũ và một RUN_ID mới.
+
+```bash
+bash scripts/resume_rubric_run.sh RUN_ID_CU --retry-into rubric-retry-v1
+```
+
+Helper khôi phục SHA, input, `LIMIT` và model từ run cũ. Pipeline kiểm tra lại rubric đã được duyệt rồi nhập vào run mới và chỉ gọi API cho các mẫu chưa hoàn thành trong phạm vi `LIMIT` đã lưu. Nếu ngắt run mới, dùng `bash scripts/resume_rubric_run.sh rubric-retry-v1`. Giữ thư mục run nguồn để kiểm tra checksum khi resume.
+
+Trong `errors.jsonl`, `metadata.failed_stage` và `metadata.retry_stages` cho biết bước sai và bước được chạy lại. Lỗi mapping sửa trên bản nháp và giữ nguyên decomposition hợp lệ. Audit chỉ yêu cầu phân rã lại khi cần sửa unit; phần phản hồi về mapping được chuyển tiếp sang lượt map tiếp theo. `verdict_source_ids` dùng ID đoạn nguồn `S…`. Nếu model trả ID unit `U…` đã có, Python đối chiếu sang các đoạn nguồn của unit và đưa kết quả cho audit. Issue có review toàn phần vẫn lưu đánh giá criterion hợp lệ, nhưng điểm Application và Outcome của issue đó để trống.
+
 Mỗi sample qua ba lượt gọi rubric gồm phân rã nhận định, ánh xạ vào issues, rồi kiểm định ngữ nghĩa từ nguồn. Bước Python xác minh evidence nguyên văn, đơn vị nguồn, ID, thứ tự và phạm vi. Các nhóm nhận định tham khảo [Điều 260 Bộ luật Tố tụng hình sự 2015](https://vanban.chinhphu.vn/default.aspx?docid=183217&pageid=27160), [Điều 266 Bộ luật Tố tụng dân sự 2015](https://vanban.chinhphu.vn/?classid=1&docid=183189&pageid=27160&typegroupid=3) và [Điều 194 Luật Tố tụng hành chính 2015](https://vanban.chinhphu.vn/default.aspx?docid=183190&pageid=27160). Category và cấp xét xử dùng trong quá trình sinh rubric. Cả năm category đã xuất hiện trong file mẫu. Category chưa hỗ trợ gây lỗi validation có số dòng.
 
 Trong run sinh rubric, xem `rubric_generation_summary.json` để biết số mẫu hoàn thành, lỗi và những `doc_name` còn thiếu. `rubric_coverage_report.json` báo tỷ lệ theo các unit thuộc phạm vi mà lượt audit đã chấp nhận, kèm số mẫu chưa được kiểm định thành công. `source_units.jsonl`, `added_issues.jsonl` và `excluded_units.jsonl` lưu nguồn và quyết định ánh xạ. `rubric_review.jsonl` lưu thiếu hụt input, verdict chưa xác định và lỗi sinh rubric. Issue gốc chưa có nhận định hỗ trợ được giữ cùng lý do review và danh sách nhóm rỗng.

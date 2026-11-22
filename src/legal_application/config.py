@@ -62,6 +62,7 @@ class Config:
     rubric_max_output_tokens: int = 65536
     rubric_json_retries: int = 2
     rubric_response_format: str = "json_schema"
+    rubric_seed_run: Path | None = None
 
     @classmethod
     def from_env(cls) -> Config:
@@ -115,6 +116,7 @@ class Config:
             rubric_max_output_tokens=int(e.get("RUBRIC_MAX_OUTPUT_TOKENS", "65536")),
             rubric_json_retries=int(e.get("RUBRIC_JSON_RETRIES", "2")),
             rubric_response_format=e.get("RUBRIC_RESPONSE_FORMAT", "json_schema"),
+            rubric_seed_run=rooted(root, e["RUBRIC_SEED_RUN"]) if mode == "build-rubrics" and e.get("RUBRIC_SEED_RUN") else None,
         )
 
     @property
