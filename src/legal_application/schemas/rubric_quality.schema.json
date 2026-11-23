@@ -1,0 +1,147 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "approved": {
+      "type": "boolean"
+    },
+    "rubric_scores": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "relevance": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "coverage": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "correctness": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "input_feasibility": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "granularity": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        }
+      },
+      "required": [
+        "relevance",
+        "coverage",
+        "correctness",
+        "input_feasibility",
+        "granularity"
+      ]
+    },
+    "rubric_problems": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "issue_index": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "criterion_index": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "severity": {
+            "enum": [
+              "major",
+              "minor"
+            ]
+          },
+          "problem": {
+            "type": "string",
+            "minLength": 1
+          },
+          "suggestion": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "issue_index",
+          "severity",
+          "problem",
+          "suggestion"
+        ]
+      }
+    },
+    "added_issue_reviews": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "issue_index": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "decision": {
+            "enum": [
+              "keep",
+              "rewrite",
+              "merge_or_remove"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          },
+          "suggestion": {
+            "type": "string",
+            "minLength": 1
+          },
+          "target_issue_index": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "issue_index",
+          "decision",
+          "reason",
+          "suggestion"
+        ]
+      }
+    },
+    "overall_feedback": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "approved",
+    "rubric_scores",
+    "rubric_problems",
+    "added_issue_reviews",
+    "overall_feedback"
+  ]
+}

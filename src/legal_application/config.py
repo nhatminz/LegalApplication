@@ -63,6 +63,13 @@ class Config:
     rubric_json_retries: int = 2
     rubric_response_format: str = "json_schema"
     rubric_seed_run: Path | None = None
+    rubric_timeout_seconds: float | None = None
+    rubric_api_max_retries: int | None = None
+    rubric_quality_base_url: str | None = None
+    rubric_quality_concurrency: int = 20
+    rubric_quality_timeout_seconds: float | None = None
+    rubric_quality_api_max_retries: int | None = None
+    rubric_quality_json_retries: int = 2
 
     @classmethod
     def from_env(cls) -> Config:
@@ -108,7 +115,7 @@ class Config:
             expected_count=int(e["EXPECTED_COUNT"]) if e.get("EXPECTED_COUNT") else None,
             final_application_jsonl=final_application if mode == "build-rubrics" else None,
             final_issue_spotting_jsonl=rooted(root, e.get("FINAL_ISSUE_SPOTTING_JSONL", "input/final/final_600_issue_spotting.jsonl")) if mode == "build-rubrics" else None,
-            rubric_base_url=e.get("RUBRIC_BASE_URL", "http://172.29.116.48:8000/v1"),
+            rubric_base_url=e.get("RUBRIC_GENERATOR_BASE_URL") or e.get("RUBRIC_BASE_URL") or "http://172.29.116.48:8000/v1",
             rubric_model=e.get("RUBRIC_MODEL", "DeepSeek-V4.1-Flash-1017"),
             rubric_api_key=e.get("RUBRIC_API_KEY", "EMPTY"),
             rubric_thinking_mode=e.get("RUBRIC_THINKING_MODE", "deepseek_vllm_xhigh"),
@@ -117,6 +124,13 @@ class Config:
             rubric_json_retries=int(e.get("RUBRIC_JSON_RETRIES", "2")),
             rubric_response_format=e.get("RUBRIC_RESPONSE_FORMAT", "json_schema"),
             rubric_seed_run=rooted(root, e["RUBRIC_SEED_RUN"]) if mode == "build-rubrics" and e.get("RUBRIC_SEED_RUN") else None,
+            rubric_timeout_seconds=float(e["RUBRIC_TIMEOUT_SECONDS"]) if e.get("RUBRIC_TIMEOUT_SECONDS") else None,
+            rubric_api_max_retries=int(e["RUBRIC_API_MAX_RETRIES"]) if e.get("RUBRIC_API_MAX_RETRIES") else None,
+            rubric_quality_base_url=e.get("RUBRIC_QUALITY_BASE_URL") or None,
+            rubric_quality_concurrency=int(e.get("RUBRIC_QUALITY_CONCURRENCY", "20")),
+            rubric_quality_timeout_seconds=float(e["RUBRIC_QUALITY_TIMEOUT_SECONDS"]) if e.get("RUBRIC_QUALITY_TIMEOUT_SECONDS") else None,
+            rubric_quality_api_max_retries=int(e["RUBRIC_QUALITY_API_MAX_RETRIES"]) if e.get("RUBRIC_QUALITY_API_MAX_RETRIES") else None,
+            rubric_quality_json_retries=int(e.get("RUBRIC_QUALITY_JSON_RETRIES", "2")),
         )
 
     @property
@@ -136,12 +150,22 @@ class Config:
             if not self.final_application_jsonl or not self.final_issue_spotting_jsonl:
                 raise ValueError("Both final dataset paths are required")
             if not self.rubric_model.strip() or not re.fullmatch(r"https?://[^\s]+", self.rubric_base_url):
-                raise ValueError("Set a valid RUBRIC_MODEL and RUBRIC_BASE_URL")
+                raise ValueError("Set a valid RUBRIC_MODEL and RUBRIC_GENERATOR_BASE_URL")
+            if self.rubric_quality_base_url and not re.fullmatch(r"https?://[^\s]+", self.rubric_quality_base_url):
+                raise ValueError("Set a valid RUBRIC_QUALITY_BASE_URL")
             resolve_thinking(self.rubric_thinking_mode)
             if min(self.rubric_concurrency, self.rubric_max_output_tokens) <= 0 or self.rubric_json_retries < 0:
                 raise ValueError("Invalid rubric concurrency, token budget or retry count")
             if self.rubric_response_format not in {"json_schema", "json_object"}:
                 raise ValueError("RUBRIC_RESPONSE_FORMAT must be json_schema or json_object")
+            if self.rubric_quality_concurrency <= 0 or self.rubric_quality_json_retries < 0:
+                raise ValueError("Invalid rubric quality concurrency or retry count")
+            for timeout in (self.rubric_timeout_seconds, self.rubric_quality_timeout_seconds):
+                if timeout is not None and timeout <= 0:
+                    raise ValueError("Rubric role timeouts must be positive")
+            for retries in (self.rubric_api_max_retries, self.rubric_quality_api_max_retries):
+                if retries is not None and retries < 0:
+                    raise ValueError("Rubric role API retry counts cannot be negative")
         if self.statistic_seed_jsonl is not None and self.mode != "statistic":
             raise ValueError("STATISTIC_SEED_JSONL is only supported in statistic mode")
         if self.mode == "full" and not (self.generator_model.strip() and self.generator_base_url):
@@ -177,5 +201,7 @@ class Config:
         if self.mode != "build-rubrics":
             result = {key: value for key, value in result.items()
                       if not key.startswith(("rubric_", "final_"))}
+        else:
+            result["rubric_quality_base_url"] = self.rubric_quality_base_url or self.rubric_base_url
         return {k: str(v) if isinstance(v, Path) else v for k, v in result.items()}
 

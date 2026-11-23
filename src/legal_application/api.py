@@ -14,6 +14,7 @@ from .scoring import LABEL_SCHEMA
 from .thinking import thinking_parameters
 
 log = logging.getLogger(__name__)
+RUBRIC_ROLES = {"rubric_generator", "rubric_quality_judge"}
 
 class APIError(RuntimeError):
     def __init__(self, message: str, metadata: dict | None = None):
@@ -34,20 +35,32 @@ class Completion:
 class APIClient:
     def __init__(self, config: Config, role: str, transport: httpx.AsyncBaseTransport | None = None):
         self.config, self.role = config, role
-        self.model = getattr(config, f"{role}_model")
-        self.base_url = getattr(config, f"{role}_base_url").rstrip("/")
-        self.key = getattr(config, f"{role}_api_key")
-        self.semaphore = asyncio.Semaphore(getattr(config, f"{role}_concurrency"))
-        self.http = httpx.AsyncClient(timeout=config.timeout_seconds, transport=transport, trust_env=False)
+        self.settings_role = "rubric" if role in RUBRIC_ROLES else role
+        self.model = getattr(config, f"{self.settings_role}_model")
+        base_url = getattr(config, f"{self.settings_role}_base_url")
+        if role == "rubric_quality_judge":
+            base_url = config.rubric_quality_base_url or base_url
+        self.base_url = base_url.rstrip("/")
+        self.key = getattr(config, f"{self.settings_role}_api_key")
+        tuning = "rubric_quality" if role == "rubric_quality_judge" else self.settings_role
+        self.semaphore = asyncio.Semaphore(getattr(config, f"{tuning}_concurrency"))
+        timeout = getattr(config, f"{tuning}_timeout_seconds", None)
+        retries = getattr(config, f"{tuning}_api_max_retries", None)
+        self.api_max_retries = config.api_max_retries if retries is None else retries
+        self.http = httpx.AsyncClient(timeout=config.timeout_seconds if timeout is None else timeout,
+                                      transport=transport, trust_env=False)
 
     def body(self, messages: list[dict], *, schema: dict | None = None) -> dict:
+        rubric = self.settings_role == "rubric"
         result = {"model": self.model, "messages": messages, "stream": False,
-                  "max_tokens": self.config.rubric_max_output_tokens if self.role == "rubric" else self.config.max_output_tokens}
-        result.update(thinking_parameters(getattr(self.config, f"{self.role}_thinking_mode")))
-        if self.role in {"judge", "rubric"}:
+                  "max_tokens": self.config.rubric_max_output_tokens if rubric else self.config.max_output_tokens}
+        result.update(thinking_parameters(getattr(self.config, f"{self.settings_role}_thinking_mode")))
+        if self.role == "judge" or rubric:
             result["response_format"] = (
-                {"type": "json_schema", "json_schema": {"name": "legal_application_labels", "strict": True, "schema": LABEL_SCHEMA if schema is None else schema}}
-                if getattr(self.config, f"{self.role}_response_format") == "json_schema" else {"type": "json_object"}
+                {"type": "json_schema", "json_schema": {
+                    "name": self.role if rubric else "legal_application_labels", "strict": True,
+                    "schema": LABEL_SCHEMA if schema is None else schema}}
+                if getattr(self.config, f"{self.settings_role}_response_format") == "json_schema" else {"type": "json_object"}
             )
         return result
 
@@ -56,7 +69,7 @@ class APIClient:
         request_id = uuid4().hex
         start = time.monotonic()
         attempts = []
-        for attempt in range(self.config.api_max_retries + 1):
+        for attempt in range(self.api_max_retries + 1):
             status, retry_after = None, 0.0
             log.info("API start role=%s doc_name=%s request=%s attempt=%d", self.role, doc_name, request_id, attempt + 1)
             try:
@@ -72,8 +85,10 @@ class APIClient:
                         pass
                     raise httpx.HTTPStatusError("retryable HTTP status", request=response.request, response=response)
                 if response.is_error:
-                    suffix = " (check json_schema/reasoning-parser support; no automatic format fallback)" if self.role in {"judge", "rubric"} and status == 400 else ""
-                    raise APIError(f"{self.role} HTTP {status}{suffix}", {"request_id": request_id, "attempts": attempts})
+                    suffix = " (check json_schema/reasoning-parser support; no automatic format fallback)" if "response_format" in body and status == 400 else ""
+                    raise APIError(f"{self.role} HTTP {status}{suffix}",
+                                   {"request_id": request_id, "http_attempts": attempt + 1, "attempts": attempts,
+                                    "latency_seconds": time.monotonic() - start})
                 data = response.json()
                 choice = data["choices"][0]
                 content = choice["message"].get("content")
@@ -94,8 +109,10 @@ class APIClient:
                 category = f"HTTP {status}" if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
                 attempts.append({"attempt": attempt + 1, "error": category})
                 log.warning("API retry role=%s doc_name=%s request=%s attempt=%d error=%s", self.role, doc_name, request_id, attempt + 1, category)
-                if attempt == self.config.api_max_retries:
-                    raise APIError(f"{self.role} exhausted API retries: {category}", {"request_id": request_id, "attempts": attempts}) from None
+                if attempt == self.api_max_retries:
+                    raise APIError(f"{self.role} exhausted API retries: {category}",
+                                   {"request_id": request_id, "http_attempts": attempt + 1, "attempts": attempts,
+                                    "latency_seconds": time.monotonic() - start}) from None
                 delay = max(retry_after, min(60.0, self.config.retry_backoff * 2 ** attempt))
                 if delay:
                     await asyncio.sleep(delay + random.uniform(0, min(delay / 4, 1)))

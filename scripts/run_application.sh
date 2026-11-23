@@ -44,11 +44,11 @@ export JUDGE_THINKING_MODE="${JUDGE_THINKING_MODE:-deepseek_vllm_xhigh}"
 export JUDGE_RESPONSE_FORMAT="${JUDGE_RESPONSE_FORMAT:-json_schema}"
 
 export LIMIT="${LIMIT:-}"  # Empty/all = ALL input; 0 = select zero; no hidden cap.
-# Mỗi batch tối đa 20 samples; mỗi giai đoạn gọi tối đa 20 requests đồng thời.
+# Mỗi batch tối đa 100 samples. Mỗi giai đoạn gọi tối đa 100 requests đồng thời.
 # LIMIT vẫn là tổng số samples của run, độc lập với mức chạy đồng thời này.
-export BATCH_SIZE="${BATCH_SIZE:-20}"
-export GENERATOR_CONCURRENCY="${GENERATOR_CONCURRENCY:-20}"
-export JUDGE_CONCURRENCY="${JUDGE_CONCURRENCY:-20}"
+export BATCH_SIZE="${BATCH_SIZE:-100}"
+export GENERATOR_CONCURRENCY="${GENERATOR_CONCURRENCY:-100}"
+export JUDGE_CONCURRENCY="${JUDGE_CONCURRENCY:-100}"
 export MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-32768}"
 export API_TIMEOUT_SECONDS="${API_TIMEOUT_SECONDS:-1800}"
 export API_MAX_RETRIES="${API_MAX_RETRIES:-3}"

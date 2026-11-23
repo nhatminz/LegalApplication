@@ -52,7 +52,17 @@ def response(value, *, fence=False):
     return httpx.Response(200, json=envelope(content))
 
 
-def build(config, handler, *, classify=None):
+def quality_review(candidate, *, problems=(), reviews=None, approved=True, score=2):
+    return {"approved": approved, "rubric_scores": dict.fromkeys(
+        ["relevance", "coverage", "correctness", "input_feasibility", "granularity"], score),
+        "rubric_problems": list(problems),
+        "added_issue_reviews": reviews if reviews is not None else [
+            {"issue_index": item["issue_index"], "decision": "keep", "reason": "Vấn đề độc lập.",
+             "suggestion": "Giữ nguyên."} for item in candidate["added_issues"]],
+        "overall_feedback": "Đã đối chiếu rubric với nguồn."}
+
+
+def build(config, handler, *, classify=None, review=None):
     def dispatch(request):
         _, payload = request_payload(request)
         if "original_category" not in payload:
@@ -62,7 +72,12 @@ def build(config, handler, *, classify=None):
         return response({"category": payload["original_category"], "confidence": "clear",
                          "reason": "Nội dung chính phù hợp nhãn gốc."})
 
-    return asyncio.run(RubricPipeline(config, rubric_transport=httpx.MockTransport(dispatch)).run())
+    def quality(request):
+        _, payload = request_payload(request)
+        return review(request) if review else response(quality_review(payload["candidate"]))
+
+    return asyncio.run(RubricPipeline(config, rubric_transport=httpx.MockTransport(dispatch),
+                                      quality_transport=httpx.MockTransport(quality)).run())
 
 
 def verify_pair(config, expected_count):
@@ -109,7 +124,7 @@ def test_direct_final_auto_add_and_warnings(config_factory):
     assert summary["status"] == "completed"
     assert summary["counts"]["completed"] == 2
     assert summary["counts"]["criteria"] == summary["counts"]["issues"] == 4
-    assert len(calls) == 2 and summary["counts"]["api_calls"] == 4
+    assert len(calls) == 2 and summary["counts"]["api_calls"] == 6
     assert summary["counts"]["failed"] == 0 and summary["counts"]["added_issues"] == 1
     assert config.input_jsonl.read_bytes() == raw_bytes
     app, _ = verify_pair(config, 2)
@@ -387,7 +402,7 @@ def test_real_input_ten_rows_with_mock_endpoint(config_factory):
     result = build(config, handler)
     assert result["status"] == "completed"
     assert result["counts"]["completed"] == 10 and len(calls) == 10
-    assert result["counts"]["api_calls"] == 20
+    assert result["counts"]["api_calls"] == 30
     assert result["counts"]["failed"] == 0
     for index, row in enumerate(verify_pair(config, 10)):
         assert evaluation_plan(rubric_sample(row, index))["issues"]
@@ -417,3 +432,245 @@ def test_existing_v2_dataset_still_validates_with_manifest(config_factory):
     atomic_json(path, {"kind": "rule_application_rubrics", "complete": True, "sample_count": 1, "rubric_protocol": 2,
                        "application": {"sha256": file_hash(config.final_application_jsonl)}})
     assert asyncio.run(Pipeline(replace(check, run_id="with-manifest")).run())["status"] == "validated"
+
+
+@pytest.mark.parametrize("quality_url", [None, "http://quality.test:8002/v1/"])
+def test_quality_judge_reviews_added_issues_and_checks_revised_rubric_independently(config_factory, quality_url):
+    raw = raw_record(category="Criminal")
+    raw["issues"] = ["Trách nhiệm hình sự của bị cáo được xác định như thế nào?"]
+    config = settings(config_factory, [raw], rubric_timeout_seconds=42, rubric_quality_timeout_seconds=23,
+                      rubric_base_url="http://rubric-generator.test:8000/v1", rubric_quality_base_url=quality_url)
+    requests = []
+    initial = [
+        ("Tiền bảo đảm phải xử lý như thế nào theo khoản 1 Điều 122 Bộ luật Tố tụng hình sự?", "rewrite"),
+        ("Tịch thu tiêu hủy ma túy và trả lại điện thoại cho bị cáo.", "rewrite"),
+        ("Có tình tiết giảm nhẹ nào khi xác định trách nhiệm hình sự của bị cáo?", "merge_or_remove"),
+        ("Khoản tiền nộp làm bảo đảm cần được giải quyết ra sao?", "merge_or_remove"),
+        ("Người bị hại có quyền yêu cầu bồi thường thiệt hại nào?", "keep"),
+    ]
+    problems = [
+        {"issue_index": 1, "criterion_index": 1, "severity": "major",
+         "problem": "Chỉ xác nhận thẩm quyền thông thường.", "suggestion": "Loại đoạn xác nhận thẩm quyền."},
+        {"issue_index": 1, "criterion_index": 2, "severity": "major",
+         "problem": "Đòi model biết Tòa đã viết gì.", "suggestion": "Hỏi cách áp dụng điều kiện cấu thành tội."},
+        {"issue_index": 1, "severity": "major", "problem": "reference_verdict=null dù nhận định có kết luận rõ.",
+         "suggestion": "Tóm tắt kết luận được nêu."},
+        {"issue_index": 1, "criterion_index": 3, "severity": "major",
+         "problem": "Cần loại tiêu chí giải thích dấu hiệu lỗi.", "suggestion": "Bỏ tiêu chí này."},
+    ]
+    replacements = {
+        2: "Khoản tiền bảo đảm cần được xử lý như thế nào?",
+        3: "Các vật chứng và tài sản liên quan cần được xử lý như thế nào?",
+        4: "Gộp tình tiết giảm nhẹ có giá trị vào gold issue.",
+        5: "Gộp nội dung có giá trị vào issue về tiền bảo đảm.",
+        6: "Giữ issue độc lập.",
+    }
+    reasons = ["Đưa điều luật vào issue.", "Tiết lộ phán quyết.", "Đã nằm trong gold issue hình sự.",
+               "Trùng ngữ nghĩa với issue về tiền bảo đảm.", "Trách nhiệm dân sự là vấn đề độc lập ở đây."]
+
+    def remember(request, role, timeout):
+        body, payload = request_payload(request)
+        assert len(body["messages"]) == 2
+        assert [m["role"] for m in body["messages"]] == ["system", "user"]
+        assert body["model"] == config.rubric_model
+        url = quality_url if role == "rubric_quality_judge" and quality_url else config.rubric_base_url
+        assert str(request.url) == url.rstrip("/") + "/chat/completions"
+        assert body["chat_template_kwargs"] == {"thinking": True, "reasoning_effort": 75}
+        assert request.extensions["timeout"]["read"] == timeout
+        assert body["response_format"]["json_schema"]["name"] == role
+        assert "DO_NOT_SAVE_REASONING" not in json.dumps(body)
+        requests.append(request.headers["X-Request-ID"])
+        return body, payload
+
+    def gen(request):
+        body, payload = remember(request, "rubric_generator", 42)
+        assert "Soạn rubric" in body["messages"][0]["content"]
+        assert payload["expected_answer"] == ANSWER
+        result = model_output(payload)
+        criterion = {"description": "Giải thích dấu hiệu lỗi từ tình tiết.", "reference_reasoning": REASONING}
+        issue = result["issues"][0]
+        if "feedback" not in payload:
+            issue["reference_verdict"] = None
+            issue["criteria"] = [
+                {**criterion, "description": "Tòa xác nhận thẩm quyền thụ lý."},
+                {**criterion, "description": "Tòa đã viết gì về trách nhiệm hình sự?"},
+                criterion,
+            ]
+            texts = [text for text, _ in initial]
+        else:
+            assert payload["feedback"]["assessment"]["rubric_problems"] == problems
+            assert payload["feedback"]["citation_findings"][0]["issue_index"] == 2
+            assert "đối chiếu" in body["messages"][0]["content"].casefold()
+            issue["criteria"] = [criterion, {**criterion, "description": "Đánh giá tình tiết giảm nhẹ liên quan."}]
+            texts = [replacements[2], replacements[3], initial[4][0]]
+            result["revision_notes"] = [
+                {"issue_index": 1, "action": "revised", "explanation": "Loại tiêu chí thẩm quyền và cập nhật verdict."},
+                {"issue_index": 1, "action": "disagreed", "explanation": "Dấu hiệu lỗi thuộc nội dung cấu thành."},
+                {"issue_index": 4, "action": "revised", "explanation": "Đã gộp giảm nhẹ vào gold issue."},
+                {"issue_index": 5, "action": "revised", "explanation": "Bỏ issue trùng về tiền bảo đảm."},
+            ]
+        result["added_issues"] = [{"issue_text": text, "reason": "Vấn đề đề xuất.", "criteria": [criterion]}
+                                  for text in texts]
+        return response(result)
+
+    def judge(request):
+        body, payload = remember(request, "rubric_quality_judge", 23)
+        assert "Tự đọc facts_clean" in body["messages"][0]["content"]
+        assert "trùng nghĩa" in body["messages"][0]["content"]
+        assert set(payload) == {"expected_answer", "facts_clean", "rules", "gold_issues", "category", "candidate"}
+        candidate = payload["candidate"]
+        if len(candidate["added_issues"]) == 5:
+            assert candidate["issues"][0]["reference_verdict"] is None
+            reviews = [{"issue_index": i, "decision": pair[1], "reason": reason, "suggestion": replacements[i]}
+                       for i, (pair, reason) in enumerate(zip(initial, reasons), 2)]
+            return response(quality_review(candidate, problems=problems, reviews=reviews, approved=False, score=1))
+        descriptions = [c["description"] for c in candidate["issues"][0]["criteria"]]
+        assert descriptions == ["Giải thích dấu hiệu lỗi từ tình tiết.", "Đánh giá tình tiết giảm nhẹ liên quan."]
+        assert candidate["issues"][0]["reference_verdict"] is not None
+        return response(quality_review(candidate))
+
+    result = build(config, gen, review=judge)
+    assert result["counts"]["feedback_rounds"] == 1
+    assert len(requests) == len(set(requests)) == 4
+    app, = verify_pair(config, 1)
+    assert set(app["rubrics"]) == {"version", "issues"} and app["rubrics"]["version"] == 4
+    assert app["input"]["issues"] == raw["issues"] + [replacements[2], replacements[3], initial[4][0]]
+    additions = read_jsonl(config.run_dir / "added_issues.jsonl")
+    assert [row["issue_text"] for row in additions] == app["input"]["issues"][1:]
+    qa, = read_jsonl(config.run_dir / "rubric_quality_reviews.jsonl")
+    assert [r["assessment"]["approved"] for r in qa["rounds"]] == [False, True]
+    assert qa["rounds"][1]["revision_notes"][1]["action"] == "disagreed"
+    assert qa["rounds"][0]["quality_judge"]["calls"][0]["usage"] == {"completion_tokens": 20}
+    assert qa["selected_round"] == 1 and qa["final_quality_scores"]["coverage"] == 2
+    assert qa["quality_warning"] is False
+    assert "DO_NOT_SAVE_REASONING" not in json.dumps(qa)
+
+
+def test_two_revision_limit_still_saves_best_rubric_and_filters_unsafe_additions(config_factory):
+    config = settings(config_factory)
+    generated, judged = [], []
+
+    def gen(request):
+        _, payload = request_payload(request)
+        result = model_output(payload)
+        idx = len(generated)
+        generated.append(payload)
+        issue = result["issues"][0]
+        issue["reference_verdict"] = f"Phiên bản {idx}"
+        criterion = issue["criteria"][0]
+        if idx:
+            result["revision_notes"] = [{"action": "disagreed", "explanation": "Giữ bản hiện tại."}]
+        result["added_issues"] = [
+            {"issue_text": "Có cần áp dụng Điều 51 không?", "reason": "Đề xuất.", "criteria": [criterion]},
+            {"issue_text": "Buộc B trả tiền.", "reason": "Đề xuất.", "criteria": [criterion]},
+            {"issue_text": "Khoản 5 triệu đồng được xử lý ra sao?", "reason": "Độc lập.", "criteria": [criterion]},
+        ]
+        return response(result)
+
+    def judge(request):
+        _, payload = request_payload(request)
+        candidate = payload["candidate"]
+        judged.append(candidate)
+        review = quality_review(candidate, approved=False, score=[0, 2, 1][len(judged) - 1])
+        rewrite = review["added_issue_reviews"][1]
+        rewrite.update(decision="rewrite", reason="Nêu sẵn phán quyết.", suggestion="Hỏi trung lập.")
+        # Simulate the Judge missing an explicit citation. The output guard still omits it.
+        return response(review)
+
+    summary = build(config, gen, review=judge)
+    assert len(generated) == len(judged) == 3
+    assert summary["counts"]["feedback_rounds"] == 2
+    assert summary["counts"]["completed"] == summary["counts"]["quality_warnings"] == 1
+    app, = verify_pair(config, 1)
+    assert app["rubrics"]["issues"][0]["reference_verdict"] == "Phiên bản 1"
+    assert app["input"]["issues"][1:] == ["Khoản 5 triệu đồng được xử lý ra sao?"]
+    assert app["rubrics"]["issues"][1]["criteria"][0]["criterion_id"] == "I2_C1"
+    qa, = read_jsonl(config.run_dir / "rubric_quality_reviews.jsonl")
+    assert qa["quality_warning"] and qa["selected_round"] == 1
+    assert [item["issue_index"] for item in qa["unresolved"]["omitted_added_issues"]] == [2, 3]
+    assert [item["issue_index"] for item in read_jsonl(config.run_dir / "added_issues.jsonl")] == [2]
+
+
+def test_resume_from_feedback_checkpoint(config_factory):
+    config = settings(config_factory)
+    tech_problem = {"severity": "major", "issue_index": 1, "problem": "Thiếu verdict.", "suggestion": "Bổ sung verdict."}
+
+    def cancel_revision(request):
+        _, payload = request_payload(request)
+        if "feedback" in payload:
+            raise asyncio.CancelledError
+        return response(model_output(payload))
+
+    def needs_fix(request):
+        _, payload = request_payload(request)
+        return response(quality_review(payload["candidate"], problems=[tech_problem], approved=False))
+
+    with pytest.raises(asyncio.CancelledError):
+        build(config, cancel_revision, review=needs_fix)
+    verify_pair(config, 0)
+
+    def revise(request):
+        _, payload = request_payload(request)
+        assert payload["feedback"]["assessment"]["rubric_problems"] == [tech_problem]
+        result = model_output(payload)
+        result["revision_notes"] = [{"issue_index": 1, "action": "revised", "explanation": "Đã kiểm tra."}]
+        return response(result)
+
+    assert build(replace(config, resume=True), revise,
+                 classify=lambda _: pytest.fail("Category already checkpointed"))["counts"]["completed"] == 1
+    assert [r["assessment"]["approved"] for r in read_jsonl(config.run_dir / "rubric_quality_reviews.jsonl")[0]["rounds"]] == [False, True]
+
+
+def test_quality_technical_retries_are_independent_and_gold_still_saved(config_factory):
+    config = settings(config_factory, rubric_api_max_retries=1, rubric_quality_api_max_retries=0,
+                      rubric_quality_json_retries=0)
+    gen_calls, judge_calls = [], []
+
+    def gen(request):
+        gen_calls.append(request.headers["X-Request-ID"])
+        if len(gen_calls) == 1:
+            return httpx.Response(503)
+        _, payload = request_payload(request)
+        result = model_output(payload)
+        result["added_issues"] = [{"issue_text": "Có phải trả thêm tiền không?", "reason": "Độc lập.",
+                                   "criteria": result["issues"][0]["criteria"]}]
+        return response(result)
+
+    def judge(request):
+        judge_calls.append(request.headers["X-Request-ID"])
+        return httpx.Response(503)
+
+    result = build(config, gen, review=judge)
+    assert len(gen_calls) == 2 and gen_calls[0] == gen_calls[1]
+    assert len(judge_calls) == 1
+    assert result["counts"]["completed"] == result["counts"]["quality_warnings"] == 1
+    assert result["counts"]["added_issues"] == 0
+    qa, = read_jsonl(config.run_dir / "rubric_quality_reviews.jsonl")
+    assert qa["unresolved"]["technical_errors"][0]["role"] == "rubric_quality_judge"
+    assert qa["final_quality_scores"] is None
+
+
+def test_quality_json_retry_does_not_trigger_revision_for_minor_feedback(config_factory):
+    config = settings(config_factory, rubric_json_retries=0, rubric_quality_json_retries=1)
+    judged = []
+
+    def generate(request):
+        _, payload = request_payload(request)
+        assert "feedback" not in payload
+        return response(model_output(payload))
+
+    def judge(request):
+        body, payload = request_payload(request)
+        judged.append(body)
+        if len(judged) == 1:
+            return response("{invalid")
+        note = {"issue_index": 1, "criterion_index": 1, "severity": "minor",
+                "problem": "Diễn đạt hơi dài.", "suggestion": "Có thể viết gọn hơn."}
+        return response(quality_review(payload["candidate"], problems=[note]))
+
+    result = build(config, generate, review=judge)
+    assert len(judged) == 2 and result["counts"]["feedback_rounds"] == 0
+    assert result["counts"]["api_calls_by_role"] == {"rubric_generator": 2, "rubric_quality_judge": 2}
+    qa, = read_jsonl(config.run_dir / "rubric_quality_reviews.jsonl")
+    assert qa["rounds"][0]["quality_judge"]["validation_errors"]
+    assert qa["quality_warning"] is False

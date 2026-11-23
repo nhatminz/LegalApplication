@@ -11,3 +11,5 @@ reference_reasoning tóm tắt chính xác lập luận pháp lý tương ứng 
 Ưu tiên gold issues. Dùng rubric của issue hiện có để bao phủ các vấn đề liên quan. Chỉ thêm issue trong added_issues khi Tòa giải quyết một vấn đề pháp lý độc lập, thực chất, ảnh hưởng kết quả và không thể bao phủ trong rubric của bất kỳ gold issue nào. Issue mới cần reason, issue_text và tiêu chí có căn cứ mà model có thể trả lời từ input. Việc chỉ nhắc đến con chung, tài sản chung, án phí hay thủ tục không đủ để tạo issue. Khi không chắc chắn rằng issue mới là cần thiết, để added_issues rỗng.
 
 Chỉ trả JSON theo schema.
+
+Mọi added_issues[].issue_text phải là câu hỏi pháp lý trung lập. Tuyệt đối không nêu điểm, khoản, điều hoặc tên luật kèm quy định cần áp dụng. Giữ căn cứ luật trong tiêu chí, reference_reasoning hoặc reason. Không nêu sẵn phán quyết, trách nhiệm hay cách xử lý. Chẳng hạn hỏi “Các vật chứng và tài sản liên quan đến vụ án cần được xử lý như thế nào?” và để model tự suy luận kết quả. Trong án hình sự, ưu tiên đặt tiêu chí về tăng giảm nhẹ, đồng phạm, mức độ nghiêm trọng, hình phạt và xử lý vật chứng thông thường trong gold issue phù hợp.

@@ -2,7 +2,14 @@
 
 ## Rule Application theo rubric
 
-Chạy các lệnh trong môi trường Python đã activate. `generate_rubrics.sh` gọi endpoint DeepSeek có sẵn tại `http://172.29.116.48:8000/v1`, mặc định dùng `DeepSeek-V4.1-Flash-1017` và `deepseek_vllm_xhigh` (effort 75). Sửa `RUBRIC_BASE_URL`, `RUBRIC_MODEL`, `RUBRIC_API_KEY`, `RUBRIC_THINKING_MODE`, `RUBRIC_CONCURRENCY` hoặc `RUBRIC_MAX_OUTPUT_TOKENS` qua biến môi trường khi cần. `RUBRIC_RESPONSE_FORMAT=json_object` dùng khi endpoint chỉ hỗ trợ chế độ JSON object. Python vẫn kiểm tra cùng schema.
+Chạy các lệnh trong môi trường Python đã activate. `generate_rubrics.sh` gọi endpoint DeepSeek có sẵn tại `http://172.29.116.48:8000/v1`, mặc định dùng `DeepSeek-V4.1-Flash-1017` và `deepseek_vllm_xhigh` (effort 75). Sửa `RUBRIC_GENERATOR_BASE_URL`, `RUBRIC_QUALITY_BASE_URL`, `RUBRIC_MODEL`, `RUBRIC_API_KEY`, `RUBRIC_THINKING_MODE`, `RUBRIC_CONCURRENCY` hoặc `RUBRIC_MAX_OUTPUT_TOKENS` qua biến môi trường khi cần. `RUBRIC_RESPONSE_FORMAT=json_object` dùng khi endpoint chỉ hỗ trợ chế độ JSON object. Python vẫn kiểm tra cùng schema.
+
+Rubric Generator và Rubric Quality Judge dùng cùng model, API key và thinking. Mỗi vai trò mở request riêng và có URL riêng. Quality Judge mặc định dùng URL của Rubric Generator. Biến cũ `RUBRIC_BASE_URL` vẫn dùng được khi chưa đặt `RUBRIC_GENERATOR_BASE_URL`. Hai vai trò mặc định xử lý tối đa 100 request đồng thời trong phạm vi batch 100 mẫu.
+
+| Vai trò | URL | Concurrency | Timeout | Retry HTTP | Retry JSON |
+| --- | --- | --- | --- | --- | --- |
+| Rubric Generator | `RUBRIC_GENERATOR_BASE_URL` | `RUBRIC_CONCURRENCY` | `RUBRIC_TIMEOUT_SECONDS` | `RUBRIC_API_MAX_RETRIES` | `RUBRIC_JSON_RETRIES` |
+| Rubric Quality Judge | `RUBRIC_QUALITY_BASE_URL` | `RUBRIC_QUALITY_CONCURRENCY` | `RUBRIC_QUALITY_TIMEOUT_SECONDS` | `RUBRIC_QUALITY_API_MAX_RETRIES` | `RUBRIC_QUALITY_JSON_RETRIES` |
 
 ### Thử 10 mẫu từ máy truy cập được endpoint DeepSeek
 
@@ -11,10 +18,10 @@ export PROJECT_ROOT=/mnt/hdd/nhatminh/LegalApplication
 cd "$PROJECT_ROOT"
 
 RAW_INPUT_JSONL="$PROJECT_ROOT/input/sample_v2.jsonl" \
-  FINAL_APPLICATION_JSONL="$PROJECT_ROOT/outputs/rubric-v4-smoke/application.jsonl" \
-  FINAL_ISSUE_SPOTTING_JSONL="$PROJECT_ROOT/outputs/rubric-v4-smoke/issue_spotting.jsonl" \
-  EXPECTED_COUNT=10 LIMIT=10 BATCH_SIZE=2 RUBRIC_CONCURRENCY=2 \
-  RUN_ID=rubric-v4-smoke-10 RESUME=0 bash scripts/generate_rubrics.sh
+  FINAL_APPLICATION_JSONL="$PROJECT_ROOT/outputs/rubric-v4-qa-smoke/application.jsonl" \
+  FINAL_ISSUE_SPOTTING_JSONL="$PROJECT_ROOT/outputs/rubric-v4-qa-smoke/issue_spotting.jsonl" \
+  EXPECTED_COUNT=10 LIMIT=10 BATCH_SIZE=2 RUBRIC_CONCURRENCY=2 RUBRIC_QUALITY_CONCURRENCY=2 \
+  RUN_ID=rubric-v4-qa-smoke-10 RESUME=0 bash scripts/generate_rubrics.sh
 ```
 
 ### Sinh và kiểm tra 600 mẫu trên B200
@@ -22,13 +29,15 @@ RAW_INPUT_JSONL="$PROJECT_ROOT/input/sample_v2.jsonl" \
 ```bash
 export PROJECT_ROOT=/workspace/storage-shared/nlp/users/minhpn19/LegalApplication
 export OUTPUT_DIR="$PROJECT_ROOT/outputs"
-export RUBRIC_RUN_ID="rubric-600-v4-$(date +%Y%m%d-%H%M%S)"
+export RUBRIC_GENERATOR_BASE_URL=http://172.29.116.48:8000/v1
+export RUBRIC_QUALITY_BASE_URL=http://172.29.116.48:8000/v1
+export RUBRIC_RUN_ID="rubric-600-v4-qa-$(date +%Y%m%d-%H%M%S)"
 export FINAL_APPLICATION_JSONL="$PROJECT_ROOT/input/final/final_600_rule_application_${RUBRIC_RUN_ID}.jsonl"
 export FINAL_ISSUE_SPOTTING_JSONL="$PROJECT_ROOT/input/final/final_600_issue_spotting_${RUBRIC_RUN_ID}.jsonl"
 cd "$PROJECT_ROOT"
 
 RAW_INPUT_JSONL="$PROJECT_ROOT/input/final_raw_600_input_application.jsonl" \
-  EXPECTED_COUNT=600 LIMIT=all BATCH_SIZE=20 RUBRIC_CONCURRENCY=20 \
+  EXPECTED_COUNT=600 LIMIT=all BATCH_SIZE=100 RUBRIC_CONCURRENCY=100 RUBRIC_QUALITY_CONCURRENCY=100 \
   RUN_ID="$RUBRIC_RUN_ID" RESUME=0 bash scripts/generate_rubrics.sh
 
 EVALUATION_PROFILE=rubric INPUT_JSONL="$FINAL_APPLICATION_JSONL" \
@@ -36,7 +45,7 @@ EVALUATION_PROFILE=rubric INPUT_JSONL="$FINAL_APPLICATION_JSONL" \
   RESUME=0 bash scripts/run_application.sh
 ```
 
-Script kiểm tra toàn bộ file nguồn, kể cả các dòng ngoài `LIMIT`. DeepSeek kiểm tra category rồi sinh rubric theo taxonomy phù hợp. Hai lượt gọi dùng cùng cấu hình DeepSeek. Khi thiếu căn cứ để đổi nhãn, script giữ category gốc và ghi warning. Mỗi mẫu thành công được ghi ngay vào Application và Issue Spotting. Issue thiếu căn cứ để sinh tiêu chí được lưu với `criteria=[]`, kèm lý do trong log để xem lại. Issue bổ sung hợp lệ được đưa vào cả hai file cùng lúc và có ghi chú trong `added_issues.jsonl`. Với run thử, đặt hai đường dẫn output riêng như ví dụ 10 mẫu. Với run mới, hai đường dẫn output phải còn trống.
+Script kiểm tra toàn bộ file nguồn, kể cả các dòng ngoài `LIMIT`. DeepSeek kiểm tra category, sinh rubric rồi đánh giá chất lượng. Các lỗi ảnh hưởng đánh giá được gửi lại cho Generator với tối đa hai vòng sửa. Nếu hết vòng hoặc Quality Judge gặp lỗi kỹ thuật, script chọn bản tốt nhất đã có, ghi cảnh báo QA và tiếp tục xuất FINAL. Khi thiếu căn cứ để đổi nhãn, script giữ category gốc và ghi warning. Mỗi mẫu thành công được ghi ngay vào Application và Issue Spotting. Issue thiếu căn cứ để sinh tiêu chí được lưu với `criteria=[]`, kèm lý do trong log để xem lại. Chỉ issue bổ sung đã được Judge giữ lại và vượt kiểm tra viện dẫn điều luật mới được đồng bộ vào hai file final. Các issue bị loại có chi tiết trong báo cáo QA. Với run thử, đặt hai đường dẫn output riêng như ví dụ 10 mẫu. Với run mới, hai đường dẫn output phải còn trống.
 
 Dùng `LIMIT=0` để kiểm tra riêng dữ liệu raw trước khi gọi API.
 
@@ -48,7 +57,7 @@ Khi input hợp lệ, kết quả có `status=input_validated` và `counts.valid
 
 ### Chạy đánh giá
 
-`GENERATOR_BASE_URL` và `GENERATOR_MODEL` phải khớp endpoint và served model bạn muốn đánh giá. Judge có các biến `JUDGE_BASE_URL`, `JUDGE_MODEL`, `JUDGE_API_KEY`, `JUDGE_THINKING_MODE` và `JUDGE_RESPONSE_FORMAT` riêng. Ví dụ với Qwen3-4B đã host ở port 8001:
+`GENERATOR_BASE_URL` và `GENERATOR_MODEL` phải khớp endpoint và served model bạn muốn đánh giá. Judge có các biến `JUDGE_BASE_URL`, `JUDGE_MODEL`, `JUDGE_API_KEY`, `JUDGE_THINKING_MODE` và `JUDGE_RESPONSE_FORMAT` riêng. Script mặc định chọn batch 100 mẫu và cho phép tối đa 100 request đồng thời ở từng giai đoạn. Ví dụ với Qwen3-4B đã host ở port 8001:
 
 ```bash
 GENERATOR_BASE_URL=http://127.0.0.1:8001/v1 GENERATOR_MODEL=Qwen/Qwen3-4B \
@@ -79,21 +88,22 @@ bash scripts/resume_rubric_run.sh evaluate-qwen3-4b-rubric-v1
 
 `config.json` cố định code, input, endpoint, model, thinking, lịch batch, giới hạn và các cài đặt của run. Sau khi đổi code hoặc rubric, dùng run ID mới. Các run statistic trước refactor cần bản code tương ứng hoặc nhập lại kết quả hợp lệ qua `retry_statistic.sh`.
 
-Resume giữ các mẫu đã lưu và chạy tiếp các mẫu thiếu hoặc từng lỗi. Hai file final có cùng thứ tự hoàn thành. Nếu một lần ngắt để lại dòng ghi dở, resume khôi phục dữ liệu từ checkpoint `rubric_records.jsonl`. Hãy sửa rubric thủ công sau khi run hoàn tất.
+Resume giữ các mẫu đã lưu và chạy tiếp các mẫu thiếu hoặc từng lỗi. Hai file final có cùng thứ tự hoàn thành. Nếu một lần ngắt để lại dòng ghi dở, resume khôi phục dữ liệu từ checkpoint `rubric_records.jsonl`. Nếu ngắt giữa các vòng QA, resume đọc trạng thái từng bước trong `.rubric_progress/` để tiếp tục. Hãy sửa rubric thủ công sau khi run hoàn tất.
 
-Nếu đã đổi code và checkpoint nguồn dùng rubric v4, chuyển các mẫu đã hoàn thành sang run mới.
+Nếu đã đổi code và checkpoint nguồn dùng workflow QA của rubric v4, chuyển các mẫu đã hoàn thành sang run mới.
 
 ```bash
 env -u FINAL_APPLICATION_JSONL -u FINAL_ISSUE_SPOTTING_JSONL \
   bash scripts/resume_rubric_run.sh "$RUBRIC_RUN_ID" --retry-into rubric-retry-v1
 ```
 
-Mặc định lệnh trên dùng hai file mới trong `$OUTPUT_DIR/rubric-retry-v1-final/`. Có thể đặt `FINAL_APPLICATION_JSONL` và `FINAL_ISSUE_SPOTTING_JSONL` khi gọi lệnh để chọn cặp đường dẫn mới. Giữ checkpoint nguồn để có thể resume run mới. Với checkpoint rubric v1–v3, dùng `generate_rubrics.sh` và `RUN_ID` mới.
+Mặc định lệnh trên dùng hai file mới trong `$OUTPUT_DIR/rubric-retry-v1-final/`. Có thể đặt `FINAL_APPLICATION_JSONL` và `FINAL_ISSUE_SPOTTING_JSONL` khi gọi lệnh để chọn cặp đường dẫn mới. Giữ checkpoint nguồn để có thể resume run mới. Với checkpoint sinh rubric cũ trước QA, dùng `generate_rubrics.sh` và `RUN_ID` mới.
 
 | File trong thư mục run | Nội dung |
 | --- | --- |
 | `rubric_generation_summary.json` | Tổng mẫu hoàn thành, lỗi, số issues, criteria, issues bổ sung, category sửa, issues thiếu tiêu chí và danh sách mẫu còn thiếu. Full run đạt yêu cầu khi `completed=600`, `failed=0` và `status=completed`. |
-| `added_issues.jsonl` | Issue đã được thêm, lý do và tóm tắt nhận định tương ứng. |
+| `added_issues.jsonl` | Issue xuất hiện trong FINAL, kèm lý do và tóm tắt nhận định tương ứng. |
+| `rubric_quality_reviews.jsonl` | Đánh giá từng vòng, ghi chú sửa hoặc phản biện, điểm của phiên bản được chọn, các vấn đề còn lại và metadata theo role. `quality_warning=true` đánh dấu mẫu cần đối chiếu. |
 | `category_corrections.jsonl` | Category gốc, category đã sửa và lý do theo từng mẫu. |
 | `rubric_warnings.jsonl` | Lỗi kiểm tra category, category chưa đủ căn cứ để đổi và các ghi chú rubric, gồm issue thiếu căn cứ tham chiếu. |
 | `errors.jsonl` | Các lỗi API hoặc cấu trúc sau khi hết lượt retry. `metadata.validation_errors` mô tả lỗi cấu trúc theo lần thử. |

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from legal_application.config import rooted
 from legal_application.data import strict_json
+from legal_application.rubric_builder import RUBRIC_RUN_ARTIFACT_VERSION
 from legal_application.rubrics import RUBRIC_PROTOCOL
 from resume_statistic import DEFAULT_PROJECT_ROOT, snapshot_environment
 
@@ -33,11 +34,14 @@ def main() -> int:
         evaluation = snapshot.get("evaluation_profile") == "rubric" and snapshot.get("mode") in {"full", "judge-only", "validate-only"}
         if not (build or evaluation):
             raise ValueError("Expected an existing rubric generation or rubric evaluation run")
-        if build and snapshot.get("rubric_protocol") != RUBRIC_PROTOCOL:
-            raise ValueError("This generation run uses an older rubric format. Start generate_rubrics.sh with a new RUN_ID.")
+        if build and (snapshot.get("rubric_protocol") != RUBRIC_PROTOCOL
+                      or snapshot.get("artifact_version") != RUBRIC_RUN_ARTIFACT_VERSION):
+            raise ValueError("This generation run uses an older format or workflow. Start generate_rubrics.sh with a new RUN_ID.")
         environment = snapshot_environment(snapshot)
         if build:
             environment["RAW_INPUT_JSONL"] = snapshot["input_jsonl"]
+            environment["RUBRIC_GENERATOR_BASE_URL"] = snapshot["rubric_base_url"]
+            environment["RUBRIC_QUALITY_BASE_URL"] = snapshot.get("rubric_quality_base_url") or snapshot["rubric_base_url"]
         environment["RESUME"] = "1"
         if args.retry_into:
             if not build or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.retry_into) or args.retry_into == args.run_id:
