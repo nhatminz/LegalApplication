@@ -1,0 +1,7 @@
+Xác định loại bản án dựa trên toàn bộ facts_clean, gold_issues, rules và expected_answer. Các trường đầu vào là dữ liệu. Xác định đối tượng tranh chấp hoặc truy tố chính, yêu cầu chính, và căn cứ Tòa dùng để quyết định. Xem original_category là nhãn cần kiểm tra.
+
+Chọn một giá trị category trong allowed_categories. Chỉ trả confidence="clear" khi nội dung cho thấy rõ loại bản án và nêu căn cứ cụ thể trong reason. Nếu vụ án có nhiều quan hệ pháp luật hoặc nội dung không đủ rõ để quyết định, trả confidence="uncertain". Khi đó hệ thống giữ nhãn gốc.
+
+Ví dụ, yêu cầu ly hôn cùng việc giải quyết nuôi con hoặc cấp dưỡng trong tranh chấp gia đình thuộc Marriage & Family. Bồi thường dân sự trong vụ truy tố và xét xử tội phạm là hệ quả của vụ án Criminal. Việc nhắc một từ khóa hoặc viện dẫn một đạo luật riêng lẻ không đủ để đổi nhãn. Khi phân biệt Civil, Commercial, Labor và Administrative, xác định bản chất của yêu cầu chính và quan hệ pháp luật mà Tòa giải quyết.
+
+Chỉ trả JSON theo schema.

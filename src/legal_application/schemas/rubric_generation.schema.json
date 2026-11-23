@@ -13,44 +13,6 @@
             "type": "integer",
             "minimum": 1
           },
-          "groups": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "group_id": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "criteria": {
-                  "type": "array",
-                  "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                      "description": {
-                        "type": "string",
-                        "minLength": 1
-                      },
-                      "reference_reasoning": {
-                        "type": "string",
-                        "minLength": 1
-                      }
-                    },
-                    "required": [
-                      "description",
-                      "reference_reasoning"
-                    ]
-                  }
-                }
-              },
-              "required": [
-                "group_id",
-                "criteria"
-              ]
-            }
-          },
           "reference_verdict": {
             "anyOf": [
               {
@@ -68,11 +30,43 @@
               "type": "string",
               "minLength": 1
             }
+          },
+          "criteria": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "description": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "reference_reasoning": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "description",
+                "reference_reasoning"
+              ]
+            }
+          },
+          "missing_reference_reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
           "issue_index",
-          "groups"
+          "criteria"
         ]
       }
     },
@@ -90,44 +84,6 @@
             "type": "string",
             "minLength": 1
           },
-          "groups": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "group_id": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "criteria": {
-                  "type": "array",
-                  "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                      "description": {
-                        "type": "string",
-                        "minLength": 1
-                      },
-                      "reference_reasoning": {
-                        "type": "string",
-                        "minLength": 1
-                      }
-                    },
-                    "required": [
-                      "description",
-                      "reference_reasoning"
-                    ]
-                  }
-                }
-              },
-              "required": [
-                "group_id",
-                "criteria"
-              ]
-            }
-          },
           "reference_verdict": {
             "anyOf": [
               {
@@ -145,12 +101,33 @@
               "type": "string",
               "minLength": 1
             }
+          },
+          "criteria": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "description": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "reference_reasoning": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "description",
+                "reference_reasoning"
+              ]
+            }
           }
         },
         "required": [
           "issue_text",
           "reason",
-          "groups"
+          "criteria"
         ]
       }
     },

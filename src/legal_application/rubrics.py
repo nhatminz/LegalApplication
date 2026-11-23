@@ -16,7 +16,7 @@ def load_schema(name: str) -> dict:
 
 
 DATASET_SCHEMA = load_schema("rule_application_dataset")
-RUBRIC_PROTOCOL = 3
+RUBRIC_PROTOCOL = 4
 
 
 def require_schema(schema: dict, value, context: str) -> None:
@@ -46,6 +46,9 @@ def raw_rubric_sample(raw: dict, index: int) -> Sample:
 
 
 def criteria_for(issue: dict) -> list[dict]:
+    if "criteria" in issue:
+        return issue["criteria"]
+    # Read historical v1–v3 datasets through the same scoring interface.
     return [criterion for group in issue["groups"] for criterion in group["criteria"]]
 
 
@@ -55,7 +58,9 @@ def issue_blocked(issue: dict) -> bool:
 
 def validate_rubric_record(row: dict) -> None:
     require_schema(DATASET_SCHEMA, row, "Rule Application dataset")
-    simple = row["rubrics"]["version"] == RUBRIC_PROTOCOL
+    version = row["rubrics"]["version"]
+    simple = version >= 3
+    flat = version == RUBRIC_PROTOCOL
     taxonomy = TAXONOMY[canonical_category(row["category"])]
     payload = row["input"]
     for field, value in [("doc_name", row["doc_name"]), ("facts_clean", payload["facts_clean"]), ("expected_answer", row["expected_answer"])]:
@@ -67,7 +72,7 @@ def validate_rubric_record(row: dict) -> None:
             if key != "citation_str" or value is not None:
                 text_field(value, f"rule.{key}")
     issues = row["rubrics"]["issues"]
-    current = row["rubrics"]["version"] == 2
+    current = version == 2
     if current and row["rubrics"].get("status") not in {"draft", "verified"}:
         raise ValueError("Version 2 rubrics require draft or verified status")
     if [issue["issue_text"] for issue in issues] != payload["issues"]:
@@ -77,13 +82,14 @@ def validate_rubric_record(row: dict) -> None:
         text_field(issue["issue_text"], "issue_text")
         if issue["issue_index"] != i:
             raise ValueError(f"Expected rubric issue_index={i}")
-        unique([group["group_id"] for group in issue["groups"]], f"group IDs in issue {i}")
-        for group in issue["groups"]:
-            group_id = group["group_id"]
-            if not simple and taxonomy.get(group_id) != group["group_name"] and not re.fullmatch(r"other_[1-9][0-9]*", group_id):
-                raise ValueError(f"Invalid group {group_id} for {row['category']}")
-            text_field(group_id, "group_id")
-            text_field(group["group_name"], "group_name")
+        if not flat:
+            unique([group["group_id"] for group in issue["groups"]], f"group IDs in issue {i}")
+            for group in issue["groups"]:
+                group_id = group["group_id"]
+                if not simple and taxonomy.get(group_id) != group["group_name"] and not re.fullmatch(r"other_[1-9][0-9]*", group_id):
+                    raise ValueError(f"Invalid group {group_id} for {row['category']}")
+                text_field(group_id, "group_id")
+                text_field(group["group_name"], "group_name")
         criteria = criteria_for(issue)
         for index, criterion in enumerate(criteria, 1):
             if criterion["criterion_id"] != f"I{i}_C{index}":

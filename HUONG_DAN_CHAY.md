@@ -11,10 +11,10 @@ export PROJECT_ROOT=/mnt/hdd/nhatminh/LegalApplication
 cd "$PROJECT_ROOT"
 
 RAW_INPUT_JSONL="$PROJECT_ROOT/input/sample_v2.jsonl" \
-  FINAL_APPLICATION_JSONL="$PROJECT_ROOT/outputs/rubric-smoke/application.jsonl" \
-  FINAL_ISSUE_SPOTTING_JSONL="$PROJECT_ROOT/outputs/rubric-smoke/issue_spotting.jsonl" \
+  FINAL_APPLICATION_JSONL="$PROJECT_ROOT/outputs/rubric-v4-smoke/application.jsonl" \
+  FINAL_ISSUE_SPOTTING_JSONL="$PROJECT_ROOT/outputs/rubric-v4-smoke/issue_spotting.jsonl" \
   EXPECTED_COUNT=10 LIMIT=10 BATCH_SIZE=2 RUBRIC_CONCURRENCY=2 \
-  RUN_ID=rubric-smoke-10 RESUME=0 bash scripts/generate_rubrics.sh
+  RUN_ID=rubric-v4-smoke-10 RESUME=0 bash scripts/generate_rubrics.sh
 ```
 
 ### Sinh và kiểm tra 600 mẫu trên B200
@@ -22,20 +22,21 @@ RAW_INPUT_JSONL="$PROJECT_ROOT/input/sample_v2.jsonl" \
 ```bash
 export PROJECT_ROOT=/workspace/storage-shared/nlp/users/minhpn19/LegalApplication
 export OUTPUT_DIR="$PROJECT_ROOT/outputs"
-export FINAL_APPLICATION_JSONL="$PROJECT_ROOT/input/final/final_600_rule_application.jsonl"
-export FINAL_ISSUE_SPOTTING_JSONL="$PROJECT_ROOT/input/final/final_600_issue_spotting.jsonl"
+export RUBRIC_RUN_ID="rubric-600-v4-$(date +%Y%m%d-%H%M%S)"
+export FINAL_APPLICATION_JSONL="$PROJECT_ROOT/input/final/final_600_rule_application_${RUBRIC_RUN_ID}.jsonl"
+export FINAL_ISSUE_SPOTTING_JSONL="$PROJECT_ROOT/input/final/final_600_issue_spotting_${RUBRIC_RUN_ID}.jsonl"
 cd "$PROJECT_ROOT"
 
 RAW_INPUT_JSONL="$PROJECT_ROOT/input/final_raw_600_input_application.jsonl" \
   EXPECTED_COUNT=600 LIMIT=all BATCH_SIZE=20 RUBRIC_CONCURRENCY=20 \
-  RUN_ID=rubric-600-simple-v1 RESUME=0 bash scripts/generate_rubrics.sh
+  RUN_ID="$RUBRIC_RUN_ID" RESUME=0 bash scripts/generate_rubrics.sh
 
 EVALUATION_PROFILE=rubric INPUT_JSONL="$FINAL_APPLICATION_JSONL" \
-  MODE=validate-only EXPECTED_COUNT=600 LIMIT=all RUN_ID=validate-rubric-600-simple-v1 \
+  MODE=validate-only EXPECTED_COUNT=600 LIMIT=all RUN_ID="validate-${RUBRIC_RUN_ID}" \
   RESUME=0 bash scripts/run_application.sh
 ```
 
-Script kiểm tra toàn bộ file nguồn, kể cả các dòng ngoài `LIMIT`. Mỗi mẫu thường cần một lượt gọi DeepSeek. Mẫu có đủ rubric cho mọi gold issue được ghi ngay vào Application và Issue Spotting. Issue bổ sung hợp lệ được đưa vào cả hai file cùng lúc và có ghi chú trong `added_issues.jsonl`. Với run thử, đặt hai đường dẫn output riêng như ví dụ 10 mẫu. Với run mới, hai đường dẫn output phải còn trống.
+Script kiểm tra toàn bộ file nguồn, kể cả các dòng ngoài `LIMIT`. DeepSeek kiểm tra category rồi sinh rubric theo taxonomy phù hợp. Hai lượt gọi dùng cùng cấu hình DeepSeek. Khi thiếu căn cứ để đổi nhãn, script giữ category gốc và ghi warning. Mỗi mẫu thành công được ghi ngay vào Application và Issue Spotting. Issue thiếu căn cứ để sinh tiêu chí được lưu với `criteria=[]`, kèm lý do trong log để xem lại. Issue bổ sung hợp lệ được đưa vào cả hai file cùng lúc và có ghi chú trong `added_issues.jsonl`. Với run thử, đặt hai đường dẫn output riêng như ví dụ 10 mẫu. Với run mới, hai đường dẫn output phải còn trống.
 
 Dùng `LIMIT=0` để kiểm tra riêng dữ liệu raw trước khi gọi API.
 
@@ -71,7 +72,7 @@ EVALUATION_PROFILE=rubric MODE=judge-only EXPECTED_COUNT=600 LIMIT=all \
 Dùng đúng run ID trong `OUTPUT_DIR`. Helper khôi phục cấu hình đã lưu và tiếp tục các sample chưa hoàn thành. Nếu API cần xác thực, export lại API key trong terminal hiện tại.
 
 ```bash
-bash scripts/resume_rubric_run.sh rubric-600-simple-v1
+bash scripts/resume_rubric_run.sh "$RUBRIC_RUN_ID"
 # Hoặc tiếp tục run đánh giá
 bash scripts/resume_rubric_run.sh evaluate-qwen3-4b-rubric-v1
 ```
@@ -80,22 +81,24 @@ bash scripts/resume_rubric_run.sh evaluate-qwen3-4b-rubric-v1
 
 Resume giữ các mẫu đã lưu và chạy tiếp các mẫu thiếu hoặc từng lỗi. Hai file final có cùng thứ tự hoàn thành. Nếu một lần ngắt để lại dòng ghi dở, resume khôi phục dữ liệu từ checkpoint `rubric_records.jsonl`. Hãy sửa rubric thủ công sau khi run hoàn tất.
 
-Nếu đã đổi code và checkpoint nguồn dùng rubric v3, chuyển các mẫu đã hoàn thành sang run mới.
+Nếu đã đổi code và checkpoint nguồn dùng rubric v4, chuyển các mẫu đã hoàn thành sang run mới.
 
 ```bash
-bash scripts/resume_rubric_run.sh rubric-600-simple-v1 --retry-into rubric-retry-v1
+env -u FINAL_APPLICATION_JSONL -u FINAL_ISSUE_SPOTTING_JSONL \
+  bash scripts/resume_rubric_run.sh "$RUBRIC_RUN_ID" --retry-into rubric-retry-v1
 ```
 
-Mặc định lệnh trên dùng hai file mới trong `$OUTPUT_DIR/rubric-retry-v1-final/`. Có thể đặt `FINAL_APPLICATION_JSONL` và `FINAL_ISSUE_SPOTTING_JSONL` khi gọi lệnh để chọn cặp đường dẫn mới. Giữ checkpoint nguồn để có thể resume run mới. Với checkpoint rubric v1/v2, dùng `generate_rubrics.sh` và `RUN_ID` mới.
+Mặc định lệnh trên dùng hai file mới trong `$OUTPUT_DIR/rubric-retry-v1-final/`. Có thể đặt `FINAL_APPLICATION_JSONL` và `FINAL_ISSUE_SPOTTING_JSONL` khi gọi lệnh để chọn cặp đường dẫn mới. Giữ checkpoint nguồn để có thể resume run mới. Với checkpoint rubric v1–v3, dùng `generate_rubrics.sh` và `RUN_ID` mới.
 
 | File trong thư mục run | Nội dung |
 | --- | --- |
-| `rubric_generation_summary.json` | Tổng mẫu hoàn thành, lỗi, số issues, criteria, issues bổ sung và danh sách mẫu còn thiếu. Full run đạt yêu cầu khi `completed=600`, `failed=0` và `status=completed`. |
+| `rubric_generation_summary.json` | Tổng mẫu hoàn thành, lỗi, số issues, criteria, issues bổ sung, category sửa, issues thiếu tiêu chí và danh sách mẫu còn thiếu. Full run đạt yêu cầu khi `completed=600`, `failed=0` và `status=completed`. |
 | `added_issues.jsonl` | Issue đã được thêm, lý do và tóm tắt nhận định tương ứng. |
-| `rubric_warnings.jsonl` | Các ghi chú khi sinh rubric để kiểm tra sau. |
+| `category_corrections.jsonl` | Category gốc, category đã sửa và lý do theo từng mẫu. |
+| `rubric_warnings.jsonl` | Lỗi kiểm tra category, category chưa đủ căn cứ để đổi và các ghi chú rubric, gồm issue thiếu căn cứ tham chiếu. |
 | `errors.jsonl` | Các lỗi API hoặc cấu trúc sau khi hết lượt retry. `metadata.validation_errors` mô tả lỗi cấu trúc theo lần thử. |
 
-Trong run đánh giá, `generations.jsonl` lưu câu trả lời và `evaluations.jsonl` lưu kết quả chấm. Judge chấm từng tiêu chí theo nội dung pháp lý. Application Score lấy trung bình các tiêu chí trong issue, các issue trong sample rồi các sample trong run. Outcome Accuracy chỉ dùng những issue có `reference_verdict`. File App rubric v3 dùng trực tiếp với `run_application.sh`. File rubric v2 đã xuất trước đây vẫn cần manifest đi kèm.
+Trong run đánh giá, `generations.jsonl` lưu câu trả lời và `evaluations.jsonl` lưu kết quả chấm. Judge chấm từng tiêu chí theo nội dung pháp lý. Application Score lấy trung bình các tiêu chí trong issue, các issue trong sample rồi các sample trong run. Outcome Accuracy chỉ dùng những issue có `reference_verdict`. Rubric v4 đặt `criteria` trực tiếp trong issue. Issue có `criteria=[]` được bỏ qua khi tính Application Score. File App rubric v3 và v4 dùng trực tiếp với `run_application.sh`. File rubric v2 đã xuất trước đây vẫn cần manifest đi kèm.
 
 ## Hướng dẫn chuẩn bị dữ liệu và đánh giá legacy
 

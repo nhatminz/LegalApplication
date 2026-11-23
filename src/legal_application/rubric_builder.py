@@ -27,64 +27,52 @@ log = logging.getLogger(__name__)
 GENERATION_SCHEMA = load_schema("rubric_generation")
 
 
-def generation_messages(sample, taxonomy, repair):
-    payload = {"expected_answer": sample.raw["expected_answer"], "category": canonical_category(sample.raw["category"]),
-               "facts_clean": sample.raw["input"]["facts_clean"], "rules": sample.raw["input"]["rules"],
-               "gold_issues": [{"issue_index": i, "issue_text": text} for i, text in enumerate(sample.issues, 1)],
-               "taxonomy": taxonomy}
-    system = prompt_text("rubric_generate") + "\nJSON SCHEMA:\n" + json.dumps(GENERATION_SCHEMA, ensure_ascii=False)
+CATEGORY_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {"category": {"enum": list(TAXONOMY)}, "confidence": {"enum": ["clear", "uncertain"]},
+                   "reason": {"type": "string", "minLength": 1}},
+    "required": ["category", "confidence", "reason"],
+}
+
+
+def structured_messages(prompt, payload, schema, repair):
+    system = prompt_text(prompt) + "\nJSON SCHEMA:\n" + json.dumps(schema, ensure_ascii=False)
     if repair:
-        system += "\nKết quả trước chưa đúng cấu trúc: " + repair + ". Trả lại đầy đủ JSON và mọi gold issue."
+        system += "\nKết quả trước chưa đúng cấu trúc: " + repair + ". Trả lại JSON đầy đủ theo schema."
     return [{"role": "system", "content": system},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, allow_nan=False)}]
 
 
-def parse_generation(content):
+def parse_response(content, schema, stage):
     content = content.strip().removeprefix("\ufeff").strip()
     fenced = re.fullmatch(r"```(?:json)?[ \t]*\r?\n(.*?)\r?\n```", content, flags=re.IGNORECASE | re.DOTALL)
     result = strict_json(fenced[1] if fenced else content)
-    require_schema(GENERATION_SCHEMA, result, "Rubric response")
+    require_schema(schema, result, stage)
     return result
 
 
-def build_issue(source, index, text, taxonomy):
-    groups, other_ids, seen, notes = {}, {}, set(), list(source.get("warnings", []))
-    for raw_group in source["groups"]:
-        model_id = raw_group["group_id"].strip()
-        group_id = model_id
-        if model_id not in taxonomy:
-            if model_id not in other_ids:
-                other_ids[model_id] = f"other_{len(other_ids) + 1}"
-                notes.append(f"Nhóm ngoài taxonomy: {model_id}")
-            group_id = other_ids[model_id]
-        for raw_criterion in raw_group["criteria"]:
-            description = raw_criterion["description"].strip()
-            reasoning = raw_criterion["reference_reasoning"].strip()
-            if not description or not reasoning:
-                notes.append("Tiêu chí có nội dung trống.")
-                continue
-            key = normalized(description), normalized(reasoning)
-            if key in seen:
-                notes.append("Tiêu chí trùng lặp.")
-                continue
-            seen.add(key)
-            groups.setdefault(group_id, []).append({"description": description, "reference_reasoning": reasoning})
-    if not groups:
-        raise ValueError(f"Issue {index} requires at least one nonempty criterion")
-    issue = {"issue_index": index, "issue_text": text, "groups": []}
-    number = 0
-    for group_id, criteria in groups.items():
-        for criterion in criteria:
-            number += 1
-            criterion["criterion_id"] = f"I{index}_C{number}"
-        issue["groups"].append({"group_id": group_id, "group_name": taxonomy.get(group_id, "Nội dung khác"),
-                                "criteria": criteria})
-    if verdict := (source.get("reference_verdict") or "").strip():
-        issue["reference_verdict"] = verdict
-    return issue, notes
+def build_issue(source, index, text):
+    criteria, seen, notes = [], set(), list(source.get("warnings", []))
+    for raw_criterion in source["criteria"]:
+        description = raw_criterion["description"].strip()
+        reasoning = raw_criterion["reference_reasoning"].strip()
+        if not description or not reasoning:
+            raise ValueError(f"Issue {index} contains a blank criterion")
+        key = normalized(description), normalized(reasoning)
+        if key in seen:
+            notes.append("Tiêu chí trùng lặp.")
+            continue
+        seen.add(key)
+        criteria.append({"criterion_id": f"I{index}_C{len(criteria) + 1}",
+                         "description": description, "reference_reasoning": reasoning})
+    if not criteria:
+        reason = (source.get("missing_reference_reason") or "").strip()
+        notes.append(f"Thiếu tiêu chí có đủ căn cứ tham chiếu. {reason}".strip())
+    verdict = (source.get("reference_verdict") or "").strip() or None
+    return {"issue_index": index, "issue_text": text, "criteria": criteria, "reference_verdict": verdict}, notes
 
 
-def materialize(sample, value, taxonomy):
+def materialize(sample, value, category):
     indexed = {row["issue_index"]: row for row in value["issues"]}
     if len(indexed) != len(value["issues"]) or indexed.keys() != set(range(1, len(sample.issues) + 1)):
         raise ValueError("Rubric response must contain each gold issue_index exactly once")
@@ -93,7 +81,7 @@ def materialize(sample, value, taxonomy):
     texts = list(sample.issues)
     known = {normalized(text) for text in texts}
     for index, text in enumerate(texts, 1):
-        issue, notes = build_issue(indexed[index], index, text, taxonomy)
+        issue, notes = build_issue(indexed[index], index, text)
         issues.append(issue)
         warnings.extend({"issue_index": index, "reason": note} for note in notes if note.strip())
     for extra in value.get("added_issues", []):
@@ -103,7 +91,9 @@ def materialize(sample, value, taxonomy):
             continue
         index = len(issues) + 1
         try:
-            issue, notes = build_issue(extra, index, text, taxonomy)
+            issue, notes = build_issue(extra, index, text)
+            if not issue["criteria"]:
+                raise ValueError("Bỏ issue bổ sung thiếu tiêu chí có căn cứ.")
         except ValueError as exc:
             warnings.append({"issue_text": text, "reason": str(exc)})
             continue
@@ -114,41 +104,70 @@ def materialize(sample, value, taxonomy):
                       "reference_reasoning": [c["reference_reasoning"] for c in criteria_for(issue)]})
         warnings.extend({"issue_index": index, "reason": note} for note in notes if note.strip())
     record = {key: value for key, value in sample.raw.items() if key != "issues"}
+    record["category"] = category
     record["input"] = {**record["input"], "issues": texts}
     record["rubrics"] = {"version": RUBRIC_PROTOCOL, "issues": issues}
     validate_rubric_record(record)
     return record, added, warnings
 
 
-async def build_sample(config, sample, client):
-    taxonomy = TAXONOMY[canonical_category(sample.raw["category"])]
-    calls, errors, repair = [], [], None
+async def request_structured(config, sample, client, stage, schema, payload, convert, calls, errors):
+    repair = None
     for attempt in range(config.rubric_json_retries + 1):
         try:
-            response = await client.complete(generation_messages(sample, taxonomy, repair),
-                                             doc_name=sample.doc_name, schema=GENERATION_SCHEMA)
+            messages = structured_messages(stage, payload, schema, repair)
+            response = await client.complete(messages, doc_name=sample.doc_name, schema=schema)
         except IncompleteResponse as exc:
-            calls.append(exc.metadata)
+            calls.append({"stage": stage, **exc.metadata})
             repair = str(exc)
         except APIError as exc:
-            calls.append(exc.metadata)
+            calls.append({"stage": stage, **exc.metadata})
             raise APIError(str(exc), {"calls": calls, "validation_errors": errors}) from None
         else:
-            calls.append(response.metadata)
+            calls.append({"stage": stage, **response.metadata})
             try:
-                record, added, warnings = materialize(sample, parse_generation(response.content), taxonomy)
+                return convert(parse_response(response.content, schema, stage))
             except ValueError as exc:
                 repair = str(exc)
-            else:
-                return {**sample.identity(), "category": sample.raw["category"], "dataset": record,
-                        "dataset_sha256": canonical_hash(record), "added_issues": added, "warnings": warnings,
-                        "model": config.rubric_model,
-                        "metadata": {"completed_at": now(), "calls": calls, "validation_errors": errors}}
-        errors.append(repair)
-        log.warning("Rubric output invalid doc_name=%s attempt=%d error=%s", sample.doc_name, attempt + 1, repair)
+        errors.append(f"{stage}: {repair}")
+        log.warning("Rubric output invalid doc_name=%s stage=%s attempt=%d error=%s",
+                    sample.doc_name, stage, attempt + 1, repair)
         if attempt < config.rubric_json_retries and config.retry_backoff:
             await asyncio.sleep(min(60.0, config.retry_backoff * 2 ** attempt))
-    raise APIError(f"Rubric output exhausted retries: {repair}", {"calls": calls, "validation_errors": errors})
+    raise APIError(f"{stage} exhausted structured output retries: {repair}",
+                   {"calls": calls, "validation_errors": errors})
+
+
+async def build_sample(config, sample, client):
+    original = sample.raw["category"]
+    category, correction, warnings = original, None, []
+    calls, errors = [], []
+    payload = {"expected_answer": sample.raw["expected_answer"], "facts_clean": sample.raw["input"]["facts_clean"],
+               "rules": sample.raw["input"]["rules"],
+               "gold_issues": [{"issue_index": i, "issue_text": text} for i, text in enumerate(sample.issues, 1)]}
+    try:
+        decision = await request_structured(config, sample, client, "rubric_category", CATEGORY_SCHEMA,
+                                           {**payload, "original_category": original, "allowed_categories": list(TAXONOMY)},
+                                           lambda result: result, calls, errors)
+    except APIError as exc:
+        log.warning("Category check failed doc_name=%s original_category=%s error=%s", sample.doc_name, original, exc)
+        warnings.append({"reason": f"Giữ category gốc vì bước kiểm tra gặp lỗi: {exc}"})
+    else:
+        reason = decision["reason"].strip()
+        if decision["confidence"] == "uncertain" or not reason:
+            warnings.append({"reason": "Giữ category gốc vì chưa đủ căn cứ. " + reason})
+        elif decision["category"] != canonical_category(original):
+            category = decision["category"]
+            correction = {"original_category": original, "corrected_category": category, "reason": reason}
+
+    taxonomy = TAXONOMY[canonical_category(category)]
+    record, added, rubric_warnings = await request_structured(
+        config, sample, client, "rubric_generate", GENERATION_SCHEMA,
+        {**payload, "category": canonical_category(category), "taxonomy": taxonomy},
+        lambda value: materialize(sample, value, category), calls, errors)
+    return {**sample.identity(), "category": category, "category_correction": correction, "dataset": record,
+            "dataset_sha256": canonical_hash(record), "added_issues": added, "warnings": warnings + rubric_warnings,
+            "model": config.rubric_model, "metadata": {"completed_at": now(), "calls": calls, "validation_errors": errors}}
 
 
 def read_seed_run(config, snapshot):
@@ -174,9 +193,11 @@ def spotting_row(record):
 
 
 def output_rows(row):
+    identity = {"doc_name": row["doc_name"], "category": row["category"]}
+    correction = row["category_correction"]
     return [[row["dataset"]], [spotting_row(row["dataset"])],
-            *([{"doc_name": row["doc_name"], "category": row["category"], **item} for item in row[key]]
-              for key in ("added_issues", "warnings"))]
+            *([{**identity, **item} for item in row[key]] for key in ("added_issues", "warnings")),
+            [{**identity, **correction}] if correction else []]
 
 
 def reconcile_jsonl(path, records):
@@ -218,6 +239,8 @@ def rubric_counts(samples, rows, errors):
             "pending": len(samples) - len(selected) - len(failed),
             "issues": len(issues), "criteria": sum(len(criteria_for(issue)) for issue in issues),
             "added_issues": sum(len(row["added_issues"]) for row in selected),
+            "issues_without_criteria": sum(not criteria_for(issue) for issue in issues),
+            "category_corrections": sum(row["category_correction"] is not None for row in selected),
             "samples_with_warnings": sum(bool(row["warnings"]) for row in selected),
             "api_calls": sum(len(row["metadata"].get("calls", [])) for row in selected + failures)}
 
@@ -238,14 +261,16 @@ class RubricPipeline(Pipeline):
         rows = list(self.completed.values())
         by_category = {}
         for sample in dataset.samples:
-            by_category.setdefault(canonical_category(sample.raw["category"]), []).append(sample)
+            category = self.completed.get(sample.doc_name, sample.raw)["category"]
+            by_category.setdefault(canonical_category(category), []).append(sample)
         counts = rubric_counts(dataset.samples, rows, self.errors)
         summary = {"run_id": self.config.run_id, "status": status, "updated_at": now(),
                    "counts": {"input": dataset.input_count, "skipped": skipped, **counts},
                    "by_category": {cat: rubric_counts(samples, rows, self.errors) for cat, samples in by_category.items()},
                    "missing_doc_names": [s.doc_name for s in dataset.samples if s.doc_name not in self.completed],
                    "outputs": {"application": str(paths[0]), "issue_spotting": str(paths[1]),
-                               "added_issues": str(paths[2]), "warnings": str(paths[3])}}
+                               "added_issues": str(paths[2]), "warnings": str(paths[3]),
+                               "category_corrections": str(paths[4])}}
         if fatal_error is not None:
             summary["fatal_error"] = {"type": type(fatal_error).__name__, "error": str(fatal_error)}
         self.write_summary(store, summary)
@@ -286,7 +311,8 @@ class RubricPipeline(Pipeline):
             raise ValueError("Dataset outputs must be distinct from each other, raw input and the run journal")
         if targets[0].with_name(targets[0].name + ".manifest.json").exists():
             raise ValueError("Application output belongs to an existing rubric publication; choose a new file")
-        paths = [*targets, store.path / "added_issues.jsonl", store.path / "rubric_warnings.jsonl"]
+        paths = [*targets, store.path / "added_issues.jsonl", store.path / "rubric_warnings.jsonl",
+                 store.path / "category_corrections.jsonl"]
         with ExitStack() as stack:
             for target in sorted(targets):
                 target.parent.mkdir(parents=True, exist_ok=True)

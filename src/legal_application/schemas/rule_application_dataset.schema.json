@@ -75,6 +75,9 @@
     "rubrics": {
       "oneOf": [
         {
+          "$ref": "#/$defs/flatRubrics"
+        },
+        {
           "$ref": "#/$defs/issueRubrics"
         },
         {
@@ -91,6 +94,80 @@
     "rubrics"
   ],
   "$defs": {
+    "flatRubrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "const": 4
+        },
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "issue_index": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "issue_text": {
+                "type": "string",
+                "minLength": 1
+              },
+              "criteria": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "criterion_id": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "description": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "reference_reasoning": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "criterion_id",
+                    "description",
+                    "reference_reasoning"
+                  ]
+                }
+              },
+              "reference_verdict": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "issue_index",
+              "issue_text",
+              "criteria",
+              "reference_verdict"
+            ]
+          },
+          "minItems": 1
+        }
+      },
+      "required": [
+        "version",
+        "issues"
+      ]
+    },
     "issueRubrics": {
       "type": "object",
       "additionalProperties": false,

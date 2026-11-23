@@ -7,7 +7,7 @@ from statistics import mean
 from jsonschema import Draft202012Validator
 
 from .data import Sample
-from .rubrics import RUBRIC_PROTOCOL, criteria_for, issue_blocked, load_schema, require_schema
+from .rubrics import criteria_for, issue_blocked, load_schema, require_schema
 
 LABEL_SCHEMA = json.loads(files("legal_application").joinpath("schemas", "judge_labels.schema.json").read_text())
 VALIDATOR = Draft202012Validator(LABEL_SCHEMA)
@@ -72,7 +72,7 @@ RUBRIC_JUDGE_SCHEMA = load_schema("rubric_judge")
 
 def evaluation_plan(sample: Sample) -> dict:
     rubric = sample.raw["rubrics"]
-    simple = rubric["version"] == RUBRIC_PROTOCOL
+    simple = rubric["version"] >= 3
     issues = []
     for issue in rubric["issues"]:
         criteria = criteria_for(issue)
@@ -105,7 +105,7 @@ def score_rubric_labels(labels: dict, sample: Sample, answer: str) -> dict:
             "needs_review" if plan["needs_review"] else "completed"):
         raise LabelError("Judge sample review status does not match the evaluation plan")
     issue_results = []
-    simple = sample.raw["rubrics"]["version"] == RUBRIC_PROTOCOL
+    simple = sample.raw["rubrics"]["version"] >= 3
     for row, planned in zip(rows, planned_issues):
         issue = planned["issue_index"]
         if row["issue_index"] != issue or row["evaluation_status"] != planned["evaluation_status"]:
